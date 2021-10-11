@@ -1,0 +1,12 @@
+[package]
+name = "glplay-rs"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nix = "0.23.0"
+gbm-sys = "0.2.0"
+libloading = "0.7.1"
+khronos-egl = { version = "4.1.0", features = ["dynamic"] }

@@ -17,7 +17,7 @@ fn main() {
     let gbm_device:*mut gbm_device = unsafe { gbm_sys::gbm_create_device(input_fd) };
     let attr:&[usize] = &[0];
     let egl_dpy = egl.get_platform_display(0x31D7, gbm_device as *mut std::ffi::c_void, attr).unwrap();
-    let res = egl.initialize(egl_dpy);
+    let _res = egl.initialize(egl_dpy);
     println!("Hello, world! res is OKay!");
     
 }

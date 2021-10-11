@@ -2,6 +2,9 @@
 name = "glplay-rs"
 version = "0.1.0"
 edition = "2018"
+license = "MIT"
+description = "Simple application to attempt to initialize egl with gbm/drm/kms"
+repository = "https://github.com/guster32/glplay-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

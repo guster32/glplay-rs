@@ -38,6 +38,8 @@ pub fn main() {
 
     let (disp_width, disp_height) = mode.size();
 
+    println!("disp_width: {}, disp_height: {}",disp_width, disp_height);
+
     // Find a crtc and FB
     let crtc = crtcinfo.get(0).expect("No crtcs found");
 

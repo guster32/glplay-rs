@@ -1,34 +1,83 @@
+extern crate drm;
 
-/// Check the `util` module to see how the `Card` structure is implemented.
-pub mod utils;
+mod utils;
 use utils::*;
+
+use drm::control::Device as ControlDevice;
+
+use drm::buffer::DrmFourcc;
+
+use drm::control::{connector, crtc};
 
 pub fn main() {
     let card = Card::open_global();
 
-    // Attempt to acquire and release master lock
-    println!("Get Master lock: {:?}", card.acquire_master_lock());
-    println!("Release Master lock: {:?}", card.release_master_lock());
+    // Load the information.
+    let res = card
+        .resource_handles()
+        .expect("Could not load normal resource ids.");
+    let coninfo: Vec<connector::Info> = res
+        .connectors()
+        .iter()
+        .flat_map(|con| card.get_connector(*con))
+        .collect();
+    let crtcinfo: Vec<crtc::Info> = res
+        .crtcs()
+        .iter()
+        .flat_map(|crtc| card.get_crtc(*crtc))
+        .collect();
 
-    // Get the Bus ID of the device
-    println!("Getting Bus ID: {:?}", card.get_bus_id().unwrap().as_ref());
+    // Filter each connector until we find one that's connected.
+    let con = coninfo
+        .iter()
+        .find(|&i| i.state() == connector::State::Connected)
+        .expect("No connected connectors");
 
-    // Figure out driver in use
-    println!("Getting driver info");
-    let driver = card.get_driver().unwrap();
-    println!("\tName: {:?}", driver.name());
-    println!("\tDate: {:?}", driver.date());
-    println!("\tDesc: {:?}", driver.description());
+    // Get the first (usually best) mode
+    let &mode = con.modes().get(0).expect("No modes found on connector");
 
-    // Enable all possible client capabilities
-    println!("Setting client capabilities");
-    for &cap in capabilities::CLIENT_CAP_ENUMS {
-        println!("\t{:?}: {:?}", cap, card.set_client_capability(cap, true));
+    let (disp_width, disp_height) = mode.size();
+
+    // Find a crtc and FB
+    let crtc = crtcinfo.get(0).expect("No crtcs found");
+
+    // Select the pixel format
+    let fmt = DrmFourcc::Rgba8888;
+
+    // Create a DB
+    // If buffer resolution is larger than display resolution, an ENOSPC (not enough video memory)
+    // error may occur
+    let mut db = card
+        .create_dumb_buffer((disp_width.into(), disp_height.into()), fmt, 32)
+        .expect("Could not create dumb buffer");
+
+    // Map it and grey it out.
+    {
+        let mut map = card
+            .map_dumb_buffer(&mut db)
+            .expect("Could not map dumbbuffer");
+        for b in map.as_mut() {
+            *b = 128;
+        }
     }
 
-    // Get driver capabilities
-    println!("Getting driver capabilities");
-    for &cap in capabilities::DRIVER_CAP_ENUMS {
-        println!("\t{:?}: {:?}", cap, card.get_driver_capability(cap));
-    }
+    // Create an FB:
+    let fb = card
+        .add_framebuffer(&db, 32, 32)
+        .expect("Could not create FB");
+
+    println!("{:#?}", mode);
+    println!("{:#?}", fb);
+    println!("{:#?}", db);
+
+    // Set the crtc
+    // On many setups, this requires root access.
+    card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
+        .expect("Could not set CRTC");
+
+    let five_seconds = ::std::time::Duration::from_millis(5000);
+    ::std::thread::sleep(five_seconds);
+
+    card.destroy_framebuffer(fb).unwrap();
+    card.destroy_dumb_buffer(db).unwrap();
 }

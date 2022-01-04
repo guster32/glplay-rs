@@ -1,13 +1,15 @@
 extern crate drm;
+extern crate gbm;
 
 mod utils;
 use utils::*;
 
-use drm::control::Device as ControlDevice;
+// use drm::control::Device as ControlDevice;
 
-use drm::buffer::DrmFourcc;
+// use drm::buffer::DrmFourcc;
 
 use drm::control::{connector, crtc};
+use gbm::{BufferObjectFlags, Device, Format};
 
 pub fn main() {
     let card = Card::open_global();
@@ -28,7 +30,7 @@ pub fn main() {
         .collect();
 
     // Filter each connector until we find one that's connected.
-    let con = coninfo
+    let con: &connector::Info = coninfo
         .iter()
         .find(|&i| i.state() == connector::State::Connected)
         .expect("No connected connectors");
@@ -43,43 +45,36 @@ pub fn main() {
     // Find a crtc and FB
     let crtc = crtcinfo.get(0).expect("No crtcs found");
 
-    // Select the pixel format
-    let fmt = DrmFourcc::Rgba8888;
+    // init a GBM device
+    let gbm = Device::new(card).unwrap();
 
-    // Create a DB
-    // If buffer resolution is larger than display resolution, an ENOSPC (not enough video memory)
-    // error may occur
-    let mut db = card
-        .create_dumb_buffer((disp_width.into(), disp_height.into()), fmt, 32)
-        .expect("Could not create dumb buffer");
+    // create a buffer
+    let mut bo = gbm
+        .create_buffer_object::<()>(
+            disp_width.into(),
+            disp_height.into(),
+            Format::Argb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::WRITE,
+        )
+        .unwrap();
 
-    // Map it and grey it out.
-    {
-        let mut map = card
-            .map_dumb_buffer(&mut db)
-            .expect("Could not map dumbbuffer");
-        for b in map.as_mut() {
-            *b = 128;
+    // write something to it (usually use import or egl rendering instead)
+    let buffer = {
+        let mut buffer = Vec::new();
+        for i in 0..disp_width {
+            for _ in 0..disp_height {
+                buffer.push(if i % 2 == 0 { 0 } else { 255 });
+            }
         }
-    }
+        buffer
+    };
+    let _noop = bo.write(&buffer).unwrap();
 
-    // Create an FB:
-    let fb = card
-        .add_framebuffer(&db, 32, 32)
-        .expect("Could not create FB");
+    // create a framebuffer from our buffer
+    let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
 
-    println!("{:#?}", mode);
-    println!("{:#?}", fb);
-    println!("{:#?}", db);
+    // display it (and get a crtc, mode and connector before)
+    gbm.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
+        .unwrap();
 
-    // Set the crtc
-    // On many setups, this requires root access.
-    card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
-        .expect("Could not set CRTC");
-
-    let five_seconds = ::std::time::Duration::from_millis(5000);
-    ::std::thread::sleep(five_seconds);
-
-    card.destroy_framebuffer(fb).unwrap();
-    card.destroy_dumb_buffer(db).unwrap();
 }

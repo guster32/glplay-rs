@@ -12,6 +12,7 @@ repository = "https://github.com/guster32/glplay-rs"
 libc = "*"
 nix = "0.23.0"
 gbm-sys = "0.2.0"
-drm = "0.6.1"
+gbm = "0.7.0"
+drm = "0.5.0"
 libloading = "0.7.1"
 khronos-egl = { version = "4.1.0", features = ["dynamic"] }

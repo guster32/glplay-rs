@@ -53,8 +53,8 @@ pub fn main() {
         .create_buffer_object::<()>(
             disp_width.into(),
             disp_height.into(),
-            Format::Argb8888,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::WRITE,
+            Format::Xbgr8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
         )
         .unwrap();
 

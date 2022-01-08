@@ -1,5 +1,6 @@
 extern crate drm;
 extern crate gbm;
+extern crate khronos_egl as egl;
 
 mod utils;
 use utils::*;
@@ -11,8 +12,39 @@ use utils::*;
 use drm::control::{connector, crtc};
 use gbm::{BufferObjectFlags, Device, Format};
 
+
+fn print_card_info(card: &dyn utils::Device) {
+    // Attempt to acquire and release master lock
+    println!("Get Master lock: {:?}", card.acquire_master_lock());
+    println!("Release Master lock: {:?}", card.release_master_lock());
+
+    // Get the Bus ID of the device
+    println!("Getting Bus ID: {:?}", card.get_bus_id().unwrap().as_ref());
+
+    // Figure out driver in use
+    println!("Getting driver info");
+    let driver = card.get_driver().unwrap();
+    println!("\tName: {:?}", driver.name());
+    println!("\tDate: {:?}", driver.date());
+    println!("\tDesc: {:?}", driver.description());
+
+    // Enable all possible client capabilities
+    println!("Setting client capabilities");
+    for &cap in capabilities::CLIENT_CAP_ENUMS {
+        println!("\t{:?}: {:?}", cap, card.set_client_capability(cap, true));
+    }
+
+    // Get driver capabilities
+    println!("Getting driver capabilities");
+    for &cap in capabilities::DRIVER_CAP_ENUMS {
+        println!("\t{:?}: {:?}", cap, card.get_driver_capability(cap));
+    }
+}
+
 pub fn main() {
     let card = Card::open_global();
+
+    print_card_info(&card);
 
     // Load the information.
     let res = card
@@ -43,14 +75,14 @@ pub fn main() {
     println!("disp_width: {}, disp_height: {}",disp_width, disp_height);
 
     // Find a crtc and FB
-    let crtc = crtcinfo.get(0).expect("No crtcs found");
+    let _crtc = crtcinfo.get(0).expect("No crtcs found");
 
     // init a GBM device
     let gbm = Device::new(card).unwrap();
 
     // create a buffer
-    let mut bo = gbm
-        .create_buffer_object::<()>(
+    let mut _bo = gbm
+        .create_surface::<()>(
             disp_width.into(),
             disp_height.into(),
             Format::Xbgr8888,
@@ -59,22 +91,22 @@ pub fn main() {
         .unwrap();
 
     // write something to it (usually use import or egl rendering instead)
-    let buffer = {
-        let mut buffer = Vec::new();
-        for i in 0..disp_width {
-            for _ in 0..disp_height {
-                buffer.push(if i % 2 == 0 { 0 } else { 255 });
-            }
-        }
-        buffer
-    };
-    let _noop = bo.write(&buffer).unwrap();
+    // let buffer = {
+    //     let mut buffer = Vec::new();
+    //     for i in 0..disp_width {
+    //         for _ in 0..disp_height {
+    //             buffer.push(if i % 2 == 0 { 0 } else { 255 });
+    //         }
+    //     }
+    //     buffer
+    // };
+    // let _noop = bo.write(&buffer).unwrap();
 
     // create a framebuffer from our buffer
-    let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
+    // let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
 
     // display it (and get a crtc, mode and connector before)
-    gbm.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
-        .unwrap();
+    // gbm.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
+    //     .unwrap();
 
 }

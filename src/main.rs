@@ -9,7 +9,7 @@ use utils::*;
 
 // use drm::buffer::DrmFourcc;
 
-use drm::control::{connector, crtc};
+use drm::control::{connector};
 use gbm::{BufferObjectFlags, Device, Format};
 
 
@@ -55,17 +55,23 @@ pub fn main() {
         .iter()
         .flat_map(|con| card.get_connector(*con))
         .collect();
-    let crtcinfo: Vec<crtc::Info> = res
-        .crtcs()
-        .iter()
-        .flat_map(|crtc| card.get_crtc(*crtc))
-        .collect();
+    // let crtcinfo: Vec<crtc::Info> = res
+    //     .crtcs()
+    //     .iter()
+    //     .flat_map(|crtc| card.get_crtc(*crtc))
+    //     .collect();
 
     // Filter each connector until we find one that's connected.
     let con: &connector::Info = coninfo
         .iter()
         .find(|&i| i.state() == connector::State::Connected)
         .expect("No connected connectors");
+
+    let enc = con.encoders().get(0)
+        .expect("No encoder found for connector")
+        .unwrap();
+    let encinfo = card.get_encoder(enc).unwrap();
+    println!("Connector Kind: {:?}", encinfo.kind());
 
     // Get the first (usually best) mode
     let &mode = con.modes().get(0).expect("No modes found on connector");
@@ -75,38 +81,41 @@ pub fn main() {
     println!("disp_width: {}, disp_height: {}",disp_width, disp_height);
 
     // Find a crtc and FB
-    let _crtc = crtcinfo.get(0).expect("No crtcs found");
+    let crtc = encinfo.crtc().expect("No crtcs found");
 
     // init a GBM device
     let gbm = Device::new(card).unwrap();
 
     // create a buffer
-    let mut _bo = gbm
-        .create_surface::<()>(
+    let mut bo = gbm
+        //.create_surface::<()>(
+        .create_buffer_object::<()>(
             disp_width.into(),
             disp_height.into(),
-            Format::Xbgr8888,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+            //Format::Xbgr8888,
+            Format::Argb8888,
+            //BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::WRITE,
         )
         .unwrap();
 
     // write something to it (usually use import or egl rendering instead)
-    // let buffer = {
-    //     let mut buffer = Vec::new();
-    //     for i in 0..disp_width {
-    //         for _ in 0..disp_height {
-    //             buffer.push(if i % 2 == 0 { 0 } else { 255 });
-    //         }
-    //     }
-    //     buffer
-    // };
-    // let _noop = bo.write(&buffer).unwrap();
+    let buffer = {
+        let mut buffer = Vec::new();
+        for i in 0..disp_width {
+            for _ in 0..disp_height {
+                buffer.push(if i % 2 == 0 { 0 } else { 255 });
+            }
+        }
+        buffer
+    };
+    let _noop = bo.write(&buffer).unwrap();
 
     // create a framebuffer from our buffer
-    // let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
+    let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
 
     // display it (and get a crtc, mode and connector before)
-    // gbm.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
-    //     .unwrap();
+    gbm.set_crtc(crtc, Some(fb), (0, 0), &[con.handle()], Some(mode))
+         .unwrap();
 
 }

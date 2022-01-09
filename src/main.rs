@@ -1,9 +1,16 @@
 extern crate drm;
 extern crate gbm;
 extern crate khronos_egl as egl;
+extern crate libloading;
 
 mod utils;
 use utils::*;
+
+use std::sync::Arc;
+use egl::{
+	EGL1_2,
+	EGL1_4
+};
 
 // use drm::control::Device as ControlDevice;
 
@@ -12,6 +19,15 @@ use utils::*;
 use drm::control::{connector};
 use gbm::{BufferObjectFlags, Device, Format};
 
+fn foo_with_1_4<V: egl::api::EGL1_4>(_egl: &egl::Instance<V>) {
+	println!("with 1.4");
+	// do something that requires at least EGL 1.4.
+}
+
+fn foo_without_1_4<V>(_egl: &egl::Instance<V>) {
+	println!("without 1.4");
+	// do something without any specific EGL version (other that 1.0).
+}
 
 fn print_card_info(card: &dyn utils::Device) {
     // Attempt to acquire and release master lock
@@ -81,41 +97,45 @@ pub fn main() {
     println!("disp_width: {}, disp_height: {}",disp_width, disp_height);
 
     // Find a crtc and FB
-    let crtc = encinfo.crtc().expect("No crtcs found");
+    let _crtc = encinfo.crtc().expect("No crtcs found");
 
     // init a GBM device
     let gbm = Device::new(card).unwrap();
 
     // create a buffer
-    let mut bo = gbm
-        //.create_surface::<()>(
-        .create_buffer_object::<()>(
+    let mut _bo = gbm
+        .create_surface::<()>(
             disp_width.into(),
             disp_height.into(),
-            //Format::Xbgr8888,
-            Format::Argb8888,
-            //BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::WRITE,
+            Format::Xbgr8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
         )
         .unwrap();
 
-    // write something to it (usually use import or egl rendering instead)
-    let buffer = {
-        let mut buffer = Vec::new();
-        for i in 0..disp_width {
-            for _ in 0..disp_height {
-                buffer.push(if i % 2 == 0 { 0 } else { 255 });
-            }
-        }
-        buffer
-    };
-    let _noop = bo.write(&buffer).unwrap();
+    	let minimal_egl = unsafe { Arc::new(egl::DynamicInstance::load().expect("unable to load libEGL.so.1")) };
+
+	println!("EGL version is {}", minimal_egl.version());
+
+	// Select the rendering API.
+	if let Some(egl1_2) = minimal_egl.upcast::<EGL1_2>() {
+		println!("selecting API");
+		 egl1_2.bind_api(egl::OPENGL_API).expect("unable to select OpenGL API");
+	}
+
+	match minimal_egl.upcast::<EGL1_4>() {
+		Some(egl1_4) => {
+			foo_with_1_4(egl1_4)
+		},
+		None => {
+			foo_without_1_4(&minimal_egl)
+		}
+	}
 
     // create a framebuffer from our buffer
-    let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
+    // let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
 
     // display it (and get a crtc, mode and connector before)
-    gbm.set_crtc(crtc, Some(fb), (0, 0), &[con.handle()], Some(mode))
-         .unwrap();
+    // gbm.set_crtc(crtc, Some(fb), (0, 0), &[con.handle()], Some(mode))
+    //      .unwrap();
 
 }

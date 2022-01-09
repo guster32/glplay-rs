@@ -8,8 +8,8 @@ use utils::*;
 
 use std::sync::Arc;
 use egl::{
-	EGL1_2,
-	EGL1_4
+	EGL1_4,
+    EGL1_5
 };
 
 // use drm::control::Device as ControlDevice;
@@ -24,8 +24,8 @@ fn foo_with_1_4<V: egl::api::EGL1_4>(_egl: &egl::Instance<V>) {
 	// do something that requires at least EGL 1.4.
 }
 
-fn foo_without_1_4<V>(_egl: &egl::Instance<V>) {
-	println!("without 1.4");
+fn foo_with_1_5<V>(_egl: &egl::Instance<V>) {
+	println!("without 1.5");
 	// do something without any specific EGL version (other that 1.0).
 }
 
@@ -112,22 +112,17 @@ pub fn main() {
         )
         .unwrap();
 
-    	let minimal_egl = unsafe { Arc::new(egl::DynamicInstance::load().expect("unable to load libEGL.so.1")) };
+    let lib = unsafe { libloading::Library::new("libEGL.so.1").expect("unable to find libEGL.so.1") };
+    let egl = unsafe { egl::DynamicInstance::<EGL1_4>::load_required_from(lib).expect("unable to load libEGL.so.1") };
 
-	println!("EGL version is {}", minimal_egl.version());
+	println!("EGL version is {}", egl.version());
 
-	// Select the rendering API.
-	if let Some(egl1_4) = minimal_egl.upcast::<EGL1_4>() {
-		println!("selecting API");
-		 egl1_4.bind_api(egl::OPENGL_API).expect("unable to select OpenGL API");
-	}
-
-	match minimal_egl.upcast::<EGL1_4>() {
-		Some(egl1_4) => {
-			foo_with_1_4(egl1_4)
+	match egl.upcast::<EGL1_5>() {
+		Some(egl1_5) => {
+			foo_with_1_5(egl1_5)
 		},
 		None => {
-			foo_without_1_4(&minimal_egl)
+			foo_with_1_4(&egl)
 		}
 	}
 

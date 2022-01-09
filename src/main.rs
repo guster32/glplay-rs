@@ -117,9 +117,9 @@ pub fn main() {
 	println!("EGL version is {}", minimal_egl.version());
 
 	// Select the rendering API.
-	if let Some(egl1_2) = minimal_egl.upcast::<EGL1_2>() {
+	if let Some(egl1_4) = minimal_egl.upcast::<EGL1_4>() {
 		println!("selecting API");
-		 egl1_2.bind_api(egl::OPENGL_API).expect("unable to select OpenGL API");
+		 egl1_4.bind_api(egl::OPENGL_API).expect("unable to select OpenGL API");
 	}
 
 	match minimal_egl.upcast::<EGL1_4>() {

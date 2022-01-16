@@ -165,7 +165,7 @@ pub fn init_drm() {
 
     // Create an FB:
     let fb = card
-        .add_framebuffer(&db, 32, 32)
+        .add_framebuffer(&db, 24, 24)
         .expect("Could not create FB");
 
     println!("{:#?}", mode);

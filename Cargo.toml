@@ -1,18 +1,13 @@
 [package]
 name = "glplay-rs"
-version = "0.1.0"
-edition = "2018"
+version = "0.0.1"
 license = "MIT"
-description = "Simple application to attempt to initialize egl with gbm/drm/kms"
+description = "Simple application to attempt to initialize egl/gles with gbm/drm/kms"
 repository = "https://github.com/guster32/glplay-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 libc = "*"
+drm = "0.6.1"
 nix = "0.23.0"
-gbm-sys = "0.2.0"
-gbm = "0.7.0"
-drm = "0.5.0"
-libloading = "0.7.1"
-khronos-egl = { version = "4.1.0", features = ["dynamic"] }

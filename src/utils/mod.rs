@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 
-extern crate drm;
-
 pub use drm::control::Device as ControlDevice;
 pub use drm::Device;
 
@@ -12,8 +10,8 @@ pub use drm::control::ResourceHandle;
 /// A simple wrapper for a device node.
 pub struct Card(std::fs::File);
 
-/// Implementing  `AsRawFd` is a prerequite to implementing the traits found
-/// in this crate. Here, we just calling `as_raw_fd()` on the inner File.
+/// Implementing `AsRawFd` is a prerequisite to implementing the traits found
+/// in this crate. Here, we are just calling `as_raw_fd()` on the inner File.
 impl std::os::unix::io::AsRawFd for Card {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.0.as_raw_fd()

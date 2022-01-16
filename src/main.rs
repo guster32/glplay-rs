@@ -1,35 +1,89 @@
-extern crate drm;
-extern crate gbm;
-extern crate khronos_egl as egl;
-extern crate libloading;
+/// Check the `util` module to see how the `Card` structure is implemented.
 
-mod utils;
+extern crate drm;
+pub mod utils;
+
 use utils::*;
 
-use std::sync::Arc;
-use egl::{
-	EGL1_4,
-    EGL1_5
-};
 
-// use drm::control::Device as ControlDevice;
+// #![allow(non_upper_case_globals)]
+// #![allow(non_camel_case_types)]
+// #![allow(non_snake_case)]
+// #![allow(dead_code)]
+// // pub mod api;
+// use libc;
+// use std::cell::RefCell;
+// use std::os::unix::io;
+// use std::result::Result::Err as Error
+// use std::os::unix::io::AsRawFd;
 
-// use drm::buffer::DrmFourcc;
+// // mod egl {
+// //     include!(concat!(env!("OUT_DIR"), "/egl_bindings.rs"));
+// // }
 
-use drm::control::{connector};
-use gbm::{BufferObjectFlags, Device, Format};
+// ///////////////////////////////  DRM  ///////////////////////////////
 
-fn foo_with_1_4<V: egl::api::EGL1_4>(_egl: &egl::Instance<V>) {
-	println!("with 1.4");
-	// do something that requires at least EGL 1.4.
-}
+// mod drm { include!(concat!(env!("OUT_DIR"), "/drm_bindings.rs")); }
+// pub const DRM_CONTEXT_VERSION: libc::c_int = 2;
 
-fn foo_with_1_5<V>(_egl: &egl::Instance<V>) {
-	println!("without 1.5");
-	// do something without any specific EGL version (other that 1.0).
-}
+// pub trait DrmEventContext {
+//     fn vblank_handler(&mut self, fd: io::RawFd, sequence: u32, sec: u32, usec: u32, data: i32);
+//     fn page_flip_handler(&mut self, fd: io::RawFd, sequence: u32, sec: u32, usec: u32, data: i32);
+// }
 
-fn print_card_info(card: &dyn utils::Device) {
+// // Thread local storage for event contexts.
+// thread_local!(static CONTEXT: RefCell<Option<Box<dyn DrmEventContext>>> = RefCell::new(None));
+
+// extern "C" fn vblank_handler(fd: libc::c_int,
+//     sequence: libc::c_uint,
+//     tv_sec: libc::c_uint,
+//     tv_usec: libc::c_uint,
+//     user_data: *mut libc::c_void) {
+//     CONTEXT.with(|s| if let Some(ref mut context) = *s.borrow_mut(){
+//             context.vblank_handler(fd, sequence, tv_sec, tv_usec, user_data as i32);
+//     });
+// }
+
+// extern "C" fn page_flip_handler(fd: libc::c_int,
+//     sequence: libc::c_uint,
+//     tv_sec: libc::c_uint,
+//     tv_usec: libc::c_uint,
+//     user_data: *mut libc::c_void) {
+//     CONTEXT.with(|s| if let Some(ref mut context) = *s.borrow_mut() {
+//         context.page_flip_handler(fd, sequence, tv_sec, tv_usec, user_data as i32);
+//     });
+// }
+
+// pub fn handle_event(fd: io::RawFd, context: Box<dyn DrmEventContext>) {
+//     CONTEXT.with(|s| *s.borrow_mut() = Some(context));
+
+//     let mut drm_context = drm::drmEventContext {
+//         version: DRM_CONTEXT_VERSION,
+//         vblank_handler: Option::Some(vblank_handler),
+//         page_flip_handler: Option::Some(page_flip_handler),
+//         page_flip_handler2: None,
+//         sequence_handler: None
+//     };
+
+//     unsafe {
+//         drm::drmHandleEvent(fd, &mut drm_context as *mut drm::drmEventContext);
+//     }
+
+//     CONTEXT.with(|s| *s.borrow_mut() = None);
+// }
+
+// struct MyDrm {
+//     fd: io::RawFd,
+//     mode: drm::drmModeModeInfo,
+//     // crtc_id: libc::c_uint,
+//     // connector_id: libc::c_uint
+// }
+
+
+
+pub fn init_drm() {
+    let card = Card::open_global();
+
     // Attempt to acquire and release master lock
     println!("Get Master lock: {:?}", card.acquire_master_lock());
     println!("Release Master lock: {:?}", card.release_master_lock());
@@ -57,80 +111,9 @@ fn print_card_info(card: &dyn utils::Device) {
     }
 }
 
+///////////////////////////////   MAIN  ///////////////////////////////
 pub fn main() {
-    let card = Card::open_global();
-
-    print_card_info(&card);
-
-    // Load the information.
-    let res = card
-        .resource_handles()
-        .expect("Could not load normal resource ids.");
-    let coninfo: Vec<connector::Info> = res
-        .connectors()
-        .iter()
-        .flat_map(|con| card.get_connector(*con))
-        .collect();
-    // let crtcinfo: Vec<crtc::Info> = res
-    //     .crtcs()
-    //     .iter()
-    //     .flat_map(|crtc| card.get_crtc(*crtc))
-    //     .collect();
-
-    // Filter each connector until we find one that's connected.
-    let con: &connector::Info = coninfo
-        .iter()
-        .find(|&i| i.state() == connector::State::Connected)
-        .expect("No connected connectors");
-
-    let enc = con.encoders().get(0)
-        .expect("No encoder found for connector")
-        .unwrap();
-    let encinfo = card.get_encoder(enc).unwrap();
-    println!("Connector Kind: {:?}", encinfo.kind());
-
-    // Get the first (usually best) mode
-    let &mode = con.modes().get(0).expect("No modes found on connector");
-
-    let (disp_width, disp_height) = mode.size();
-
-    println!("disp_width: {}, disp_height: {}",disp_width, disp_height);
-
-    // Find a crtc and FB
-    let _crtc = encinfo.crtc().expect("No crtcs found");
-
-    // init a GBM device
-    let gbm = Device::new(card).unwrap();
-
-    // create a buffer
-    let mut _bo = gbm
-        .create_surface::<()>(
-            disp_width.into(),
-            disp_height.into(),
-            Format::Xbgr8888,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
-        )
-        .unwrap();
-
-    let lib = unsafe { libloading::Library::new("libEGL.so.1").expect("unable to find libEGL.so.1") };
-    let egl = unsafe { egl::DynamicInstance::<EGL1_4>::load_required_from(lib).expect("unable to load libEGL.so.1") };
-
-	println!("EGL version is {}", egl.version());
-
-	match egl.upcast::<EGL1_5>() {
-		Some(egl1_5) => {
-			foo_with_1_5(egl1_5)
-		},
-		None => {
-			foo_with_1_4(&egl)
-		}
-	}
-
-    // create a framebuffer from our buffer
-    // let fb = gbm.add_framebuffer(&bo, 32, 32).unwrap();
-
-    // display it (and get a crtc, mode and connector before)
-    // gbm.set_crtc(crtc, Some(fb), (0, 0), &[con.handle()], Some(mode))
-    //      .unwrap();
-
+    init_drm();
+    println!("THisis a test");
 }
+///////////////////////////////   MAIN  ///////////////////////////////

@@ -81,8 +81,35 @@ use drm::control::{connector, crtc};
 //     // crtc_id: libc::c_uint,
 //     // connector_id: libc::c_uint
 // }
+pub fn read_card_properties() {
+    let card = Card::open_global();
 
+    // Attempt to acquire and release master lock
+    println!("Get Master lock: {:?}", card.acquire_master_lock());
+    println!("Release Master lock: {:?}", card.release_master_lock());
 
+    // Get the Bus ID of the device
+    println!("Getting Bus ID: {:?}", card.get_bus_id().unwrap().as_ref());
+
+    // Figure out driver in use
+    println!("Getting driver info");
+    let driver = card.get_driver().unwrap();
+    println!("\tName: {:?}", driver.name());
+    println!("\tDate: {:?}", driver.date());
+    println!("\tDesc: {:?}", driver.description());
+
+    // Enable all possible client capabilities
+    println!("Setting client capabilities");
+    for &cap in capabilities::CLIENT_CAP_ENUMS {
+        println!("\t{:?}: {:?}", cap, card.set_client_capability(cap, true));
+    }
+
+    // Get driver capabilities
+    println!("Getting driver capabilities");
+    for &cap in capabilities::DRIVER_CAP_ENUMS {
+        println!("\t{:?}: {:?}", cap, card.get_driver_capability(cap));
+    }
+}
 
 pub fn init_drm() {
     let card = Card::open_global();
@@ -159,6 +186,7 @@ pub fn init_drm() {
 
 ///////////////////////////////   MAIN  ///////////////////////////////
 pub fn main() {
+    read_card_properties();
     init_drm();
     println!("THisis a test");
 }

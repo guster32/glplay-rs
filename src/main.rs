@@ -140,6 +140,8 @@ pub fn init_drm() {
 
     let (disp_width, disp_height) = mode.size();
 
+    let depth:u32 = card.get_driver_capability(drm::DriverCapability::DumbPreferredDepth).unwrap() as u32;
+
     // Find a crtc and FB
     let crtc = crtcinfo.get(0).expect("No crtcs found");
 
@@ -165,7 +167,7 @@ pub fn init_drm() {
 
     // Create an FB:
     let fb = card
-        .add_framebuffer(&db, 24, 32)
+        .add_framebuffer(&db, depth, 32)
         .expect("Could not create FB");
 
     println!("{:#?}", mode);

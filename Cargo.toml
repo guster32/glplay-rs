@@ -2,12 +2,17 @@
 name = "glplay-rs"
 version = "0.0.1"
 license = "MIT"
-description = "Simple application to attempt to initialize egl/gles with gbm/drm/kms"
+description = "Simple application to attempt to initialize egl/gles with gbm/kms"
 repository = "https://github.com/guster32/glplay-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libc = "*"
-drm = "0.6.1"
-nix = "0.23.0"
+drm-rs = { path = "drm-rs", version = "0.0.1" }
+
+[workspace]
+members = [
+    "drm-rs",
+    "drm-rs/drm-ffi",
+    "drm-rs/drm-ffi/drm-sys",
+]

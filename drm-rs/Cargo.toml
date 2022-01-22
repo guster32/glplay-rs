@@ -1,0 +1,11 @@
+[package]
+name = "drm-rs"
+description = "Safe, low-level bindings to the Direct Rendering Manager API"
+version = "0.0.1"
+license = "MIT"
+authors = ["Gustavo Branco <guster32@gmail.com>"]
+
+[dependencies]
+drm-ffi = { path = "drm-ffi", version = "0.0.1" }
+drm-fourcc = "^2.0.0"
+nix = "^0.23.1"

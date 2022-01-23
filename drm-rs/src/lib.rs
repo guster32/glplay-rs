@@ -1,3 +1,36 @@
+
+  
+//! A safe interface to the Direct Rendering Manager subsystem found in various
+//! operating systems.
+//!
+//! # Summary
+//!
+//! The Direct Rendering Manager (DRM) is subsystem found in various operating
+//! systems that exposes graphical functionality to userspace processes. It can
+//! be used to send data and commands to a GPU driver that implements the
+//! interface.
+//!
+//! Userspace processes can access the DRM by opening a 'device node' (usually
+//! found in `/dev/dri/*`) and using various `ioctl` commands on the open file
+//! descriptor. Most processes use the libdrm library (part of the mesa project)
+//! to execute these commands. This crate takes a more direct approach,
+//! bypassing libdrm and executing the commands directly and doing minimal
+//! abstraction to keep the interface safe.
+//!
+//! While the DRM subsystem exposes many powerful GPU interfaces, it is not
+//! recommended for rendering or GPGPU operations. There are many standards made
+//! for these use cases, and they are far more fitting for those sort of tasks.
+//!
+//! ## Usage
+//!
+//! To begin using this crate, the [`Device`] trait must be
+//! implemented. See the trait's [example section](trait@Device#example) for
+//! details on how to implement it.
+//!
+
+#![warn(missing_docs)]
+extern crate core;
+
 extern crate drm_ffi;
 
 extern crate drm_fourcc;
@@ -12,6 +45,55 @@ use std::os::unix::io::AsRawFd;
 pub use drm_ffi::result::SystemError;
 use util::*;
 
+/// This trait should be implemented by any object that acts as a DRM device. It
+/// is a prerequisite for using any DRM functionality.
+///
+/// This crate does not provide a concrete device object due to the various ways
+/// it can be implemented. The user of this crate is expected to implement it
+/// themselves and derive this trait as necessary. The example below
+/// demonstrates how to do this using a small wrapper.
+///
+/// # Example
+///
+/// ```
+/// extern crate drm;
+///
+/// use drm::Device;
+///
+/// use std::fs::File;
+/// use std::fs::OpenOptions;
+///
+/// use std::os::unix::io::RawFd;
+/// use std::os::unix::io::AsRawFd;
+///
+/// #[derive(Debug)]
+/// /// A simple wrapper for a device node.
+/// struct Card(File);
+///
+/// /// Implementing [`AsRawFd`] is a prerequisite to implementing the traits found
+/// /// in this crate. Here, we are just calling [`File::as_raw_fd()`] on the inner
+/// /// [`File`].
+/// impl AsRawFd for Card {
+///     fn as_raw_fd(&self) -> RawFd {
+///         self.0.as_raw_fd()
+///     }
+/// }
+///
+/// /// With [`AsRawFd`] implemented, we can now implement [`drm::Device`].
+/// impl Device for Card {}
+///
+/// impl Card {
+///     /// Simple helper method for opening a [`Card`].
+///     fn open() -> Self {
+///         let mut options = OpenOptions::new();
+///         options.read(true);
+///         options.write(true);
+///
+///         // The normal location of the primary device node on Linux
+///         Card(options.open("/dev/dri/card0").unwrap())
+///     }
+/// }
+/// ```
 pub trait Device: AsRawFd {
     /// Acquires the DRM Master lock for this process.
     ///

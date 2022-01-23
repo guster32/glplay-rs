@@ -12,17 +12,7 @@ use std::path::PathBuf;
 //     .header("wrapper.h")
 //     .ctypes_prefix("libc")
 //     .with_codegen_config(config)
-//     .prepend_enum_name(false)
-//     .layout_tests(false)
-//     .generate_comments(false)
-//     .rustfmt_bindings(true)
-//     .derive_copy(true)
-//     .derive_debug(true)
-//     .derive_default(true)
-//     .derive_hash(true)
-//     .derive_eq(true)
-//     .allowlist_recursively(true)
-//     .use_core()
+
 
 pub fn main() {
     // Tell cargo to invalidate the built crate whenever the wrapper changes
@@ -32,6 +22,17 @@ pub fn main() {
         .clang_arg("-I/usr/include/drm")
         .header("wrapper.h")
         .derive_default(true)
+        .prepend_enum_name(false)
+        .layout_tests(false)
+        .generate_comments(false)
+        .rustfmt_bindings(true)
+        .derive_copy(true)
+        .derive_debug(true)
+        .derive_default(true)
+        .derive_hash(true)
+        .derive_eq(true)
+        .allowlist_recursively(true)
+        // .use_core()
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))

@@ -112,12 +112,12 @@ pub fn read_card_properties() {
 }
 
 pub fn init_drm() {
-//    let card = Card::open_global();
+   let card = Card::open_global();
 
-//     // Load the information.
-//     let res = card
-//         .resource_handles()
-//         .expect("Could not load normal resource ids.");
+    // Load the information.
+    let _res = card
+        .resource_handles()
+        .expect("Could not load normal resource ids.");
 //     let coninfo: Vec<connector::Info> = res
 //         .connectors()
 //         .iter()

@@ -1,4 +1,9 @@
+//!
+//! Foreign function interface
+//!
 
+#![warn(missing_docs)]
+#![allow(unused_doc_comments)]
 pub extern crate drm_sys;
 pub use drm_sys::*;
 
@@ -9,6 +14,7 @@ pub(crate) mod utils;
 
 use result::SystemError as Error;
 pub mod ioctl;
+pub mod mode;
 pub mod result;
 
 use std::os::unix::io::RawFd;

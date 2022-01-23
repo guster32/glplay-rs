@@ -40,3 +40,11 @@ ioctl_write_ptr!(set_cap, DRM_IOCTL_BASE, 0x0d, drm_set_client_cap);
 // # Permissions: None
 // # Nodes: All
 ioctl_readwrite!(get_version, DRM_IOCTL_BASE, 0x00, drm_version);
+
+pub(crate) mod mode {
+    use drm_sys::*;
+    use nix::ioctl_readwrite;
+
+    //Modesetting resources
+    ioctl_readwrite!(get_resources, DRM_IOCTL_BASE, 0xA0, drm_mode_card_res);
+}

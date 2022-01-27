@@ -32,7 +32,8 @@ impl Card {
     }
 
     pub fn open_global() -> Self {
-        Self::open("/dev/dri/card0")
+        let device = std::env::var("DEV").unwrap_or("/dev/dri/card0".to_string());
+        Self::open(&device)
     }
 }
 

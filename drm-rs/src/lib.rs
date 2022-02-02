@@ -38,6 +38,7 @@ extern crate nix;
 
 pub(crate) mod util;
 
+pub mod buffer;
 pub mod control;
 
 use std::os::unix::io::AsRawFd;

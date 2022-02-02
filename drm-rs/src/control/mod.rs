@@ -32,11 +32,14 @@ use drm_ffi as ffi;
 use drm_ffi::result::SystemError;
 pub mod connector;
 pub mod crtc;
+pub mod dumbbuffer;
 pub mod encoder;
 pub mod framebuffer;
 
 // pub mod property;
 
+use self::dumbbuffer::*;
+use buffer;
 
 use std::mem;
 
@@ -113,6 +116,176 @@ pub trait Device: super::Device {
         };
 
         Ok(res)
+    }
+
+    /// Returns information about a specific connector
+    fn get_connector(&self, handle: connector::Handle) -> Result<connector::Info, SystemError> {
+        // Maximum number of encoders is 3 due to kernel restrictions
+        let mut encoders = [0u32; 3];
+        let mut enc_slice = &mut encoders[..];
+        let mut modes = Vec::new();
+
+        let ffi_info = ffi::mode::get_connector(
+            self.as_raw_fd(),
+            handle.into(),
+            None,
+            None,
+            Some(&mut modes),
+            Some(&mut enc_slice),
+        )?;
+
+        let connector = connector::Info {
+            handle,
+            interface: connector::Interface::from(ffi_info.connector_type),
+            interface_id: ffi_info.connector_type_id,
+            connection: connector::State::from(ffi_info.connection),
+            size: match (ffi_info.mm_width, ffi_info.mm_height) {
+                (0, 0) => None,
+                (x, y) => Some((x, y)),
+            },
+            modes: unsafe { mem::transmute(modes) },
+            encoders: unsafe { mem::transmute(encoders) },
+            curr_enc: unsafe { mem::transmute(ffi_info.encoder_id) },
+        };
+
+        Ok(connector)
+    }
+
+    /// Returns information about a specific encoder
+    fn get_encoder(&self, handle: encoder::Handle) -> Result<encoder::Info, SystemError> {
+        let info = ffi::mode::get_encoder(self.as_raw_fd(), handle.into())?;
+
+        let enc = encoder::Info {
+            handle,
+            enc_type: encoder::Kind::from(info.encoder_type),
+            crtc: from_u32(info.crtc_id),
+            pos_crtcs: info.possible_crtcs,
+            pos_clones: info.possible_clones,
+        };
+
+        Ok(enc)
+    }
+
+    /// Returns information about a specific CRTC
+    fn get_crtc(&self, handle: crtc::Handle) -> Result<crtc::Info, SystemError> {
+        let info = ffi::mode::get_crtc(self.as_raw_fd(), handle.into())?;
+
+        let crtc = crtc::Info {
+            handle,
+            position: (info.x, info.y),
+            mode: match info.mode_valid {
+                0 => None,
+                _ => Some(Mode::from(info.mode)),
+            },
+            fb: from_u32(info.fb_id),
+            gamma_length: info.gamma_size,
+        };
+
+        Ok(crtc)
+    }
+
+    /// Set CRTC state
+    fn set_crtc(
+        &self,
+        handle: crtc::Handle,
+        framebuffer: Option<framebuffer::Handle>,
+        pos: (u32, u32),
+        conns: &[connector::Handle],
+        mode: Option<Mode>,
+    ) -> Result<(), SystemError> {
+        let _info = ffi::mode::set_crtc(
+            self.as_raw_fd(),
+            handle.into(),
+            framebuffer.map(|x| x.into()).unwrap_or(0),
+            pos.0,
+            pos.1,
+            unsafe { &*(conns as *const _ as *const [u32]) },
+            unsafe { mem::transmute(mode) },
+        )?;
+
+        Ok(())
+    }
+
+    /// Create a new dumb buffer with a given size and pixel format
+    fn create_dumb_buffer(
+        &self,
+        size: (u32, u32),
+        format: buffer::DrmFourcc,
+        bpp: u32,
+    ) -> Result<DumbBuffer, SystemError> {
+        let info = drm_ffi::mode::dumbbuffer::create(self.as_raw_fd(), size.0, size.1, bpp, 0)?;
+
+        let dumb = DumbBuffer {
+            size: (info.width, info.height),
+            length: info.size as usize,
+            format,
+            pitch: info.pitch,
+            handle: unsafe { mem::transmute(info.handle) },
+        };
+
+        Ok(dumb)
+    }
+
+    /// Map the buffer for access
+    fn map_dumb_buffer<'a>(
+        &self,
+        buffer: &'a mut DumbBuffer,
+    ) -> Result<DumbMapping<'a>, SystemError> {
+        let info = drm_ffi::mode::dumbbuffer::map(self.as_raw_fd(), buffer.handle.into(), 0, 0)?;
+
+        let map = {
+            use nix::sys::mman;
+            let addr = core::ptr::null_mut();
+            let prot = mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE;
+            let flags = mman::MapFlags::MAP_SHARED;
+            let length = buffer.length;
+            let fd = self.as_raw_fd();
+            let offset = info.offset as _;
+            unsafe { mman::mmap(addr, length, prot, flags, fd, offset)? }
+        };
+
+        let mapping = DumbMapping {
+            _phantom: ::std::marker::PhantomData,
+            map: unsafe { ::std::slice::from_raw_parts_mut(map as *mut _, buffer.length) },
+        };
+
+        Ok(mapping)
+    }
+
+    /// Destroy a framebuffer
+    fn destroy_framebuffer(&self, handle: framebuffer::Handle) -> Result<(), SystemError> {
+        ffi::mode::rm_fb(self.as_raw_fd(), handle.into())
+    }
+
+    /// Free the memory resources of a dumb buffer
+    fn destroy_dumb_buffer(&self, buffer: DumbBuffer) -> Result<(), SystemError> {
+        let _info = drm_ffi::mode::dumbbuffer::destroy(self.as_raw_fd(), buffer.handle.into())?;
+
+        Ok(())
+    }
+
+    /// Add a new framebuffer
+    fn add_framebuffer<B>(
+        &self,
+        buffer: &B,
+        depth: u32,
+        bpp: u32,
+    ) -> Result<framebuffer::Handle, SystemError>
+    where
+        B: buffer::Buffer + ?Sized,
+    {
+        let (w, h) = buffer.size();
+        let info = ffi::mode::add_fb(
+            self.as_raw_fd(),
+            w,
+            h,
+            buffer.pitch(),
+            bpp,
+            depth,
+            buffer.handle().into(),
+        )?;
+
+        Ok(unsafe { mem::transmute(info.fb_id) })
     }
 
 }

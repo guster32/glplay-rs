@@ -1,12 +1,14 @@
 /// Check the `util` module to see how the `Card` structure is implemented.
 
 extern crate drm_rs;
+extern crate gbm_rs;
 pub mod utils;
 
 use utils::*;
 
 use drm_rs::buffer::DrmFourcc;
 use drm_rs::control::{connector, crtc};
+// use gbm_rs::Device as GbmDevice;
 
 
 // #![allow(non_upper_case_globals)]
@@ -147,6 +149,9 @@ pub fn init_drm() {
 
     // Select the pixel format
     let fmt = DrmFourcc::Xbgr8888;
+
+    // let _gbm = GbmDevice::new(card).expect("Could not create gbm device");
+
 
     // Create a DB
     // If buffer resolution is larger than display resolution, an ENOSPC (not enough video memory)

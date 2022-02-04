@@ -165,6 +165,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "gbm-rs"
+version = "0.0.1"
+dependencies = [
+ "bitflags",
+ "drm-fourcc",
+ "drm-rs",
+ "gbm-sys",
+ "libc",
+]
+
+[[package]]
+name = "gbm-sys"
+version = "0.0.1"
+dependencies = [
+ "bindgen",
+ "libc",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -175,6 +194,7 @@ name = "glplay-rs"
 version = "0.0.1"
 dependencies = [
  "drm-rs",
+ "gbm-rs",
 ]
 
 [[package]]

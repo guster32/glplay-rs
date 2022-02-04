@@ -1,0 +1,17 @@
+[package]
+name = "gbm-sys"
+version = "0.0.1"
+authors = ["Gustavo Branco <guster32@gmail.com>"]
+build = "build.rs"
+description = "Bindgen generated unsafe libgbm wrapper"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libc = { version = "^0.2.113"}
+
+
+[build-dependencies]
+bindgen = "0.59.2"

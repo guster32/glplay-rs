@@ -9,10 +9,13 @@ repository = "https://github.com/guster32/glplay-rs"
 
 [dependencies]
 drm-rs = { path = "drm-rs", version = "0.0.1" }
+gbm-rs = { path = "gbm-rs", version = "0.0.1" }
 
 [workspace]
 members = [
     "drm-rs",
     "drm-rs/drm-ffi",
     "drm-rs/drm-ffi/drm-sys",
+    "gbm-rs",
+    "gbm-rs/gbm-sys",
 ]

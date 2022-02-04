@@ -6,7 +6,7 @@ license = "MIT"
 authors = ["Gustavo Branco <guster32@gmail.com>"]
 
 [dependencies]
-bitflags = "1"
+bitflags = "1.2"
 drm-ffi = { path = "drm-ffi", version = "0.0.1" }
 drm-fourcc = "^2.0.0"
 nix = "^0.23.1"

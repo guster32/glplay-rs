@@ -1,0 +1,14 @@
+[package]
+name = "gbm-rs"
+description = "libgbm bindings for rust"
+license = "MIT"
+version = "0.0.1"
+authors = ["Gustavo Branco <guster32@gmail.com>"]
+
+[dependencies]
+libc = { version = "^0.2.113"}
+drm-rs = { path = "../drm-rs", version = "0.0.1" }
+gbm-sys = { path = "gbm-sys", version = "0.0.1" }
+bitflags = "1.2"
+drm-fourcc = "^2.0.0"
+

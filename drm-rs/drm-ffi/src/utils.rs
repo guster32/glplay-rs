@@ -1,4 +1,3 @@
-
 /// Takes an `Option<&mut &mut [T]>` style buffer and gets its pointer.
 macro_rules! map_ptr {
     ($buffer:expr) => {

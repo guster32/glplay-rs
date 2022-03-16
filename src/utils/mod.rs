@@ -1,60 +1,37 @@
-#![allow(dead_code)]
+//! Various utilities functions and types
 
-pub use drm_rs::control::Device as ControlDevice;
-pub use drm_rs::Device;
+mod geometry;
+pub mod signaling;
 
-// pub use drm::control::property::*;
-// pub use drm::control::ResourceHandle;
+#[cfg(feature = "x11rb_event_source")]
+pub mod x11rb;
 
+#[cfg(feature = "desktop")]
+pub(crate) mod ids;
+pub mod user_data;
+
+pub use self::geometry::{Buffer, Coordinate, Logical, Physical, Point, Raw, Rectangle, Size, Transform};
+
+/// This resource is not managed by Smithay
 #[derive(Debug)]
-/// A simple wrapper for a device node.
-pub struct Card(std::fs::File);
+pub struct UnmanagedResource;
 
-/// Implementing `AsRawFd` is a prerequisite to implementing the traits found
-/// in this crate. Here, we are just calling `as_raw_fd()` on the inner File.
-impl std::os::unix::io::AsRawFd for Card {
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        self.0.as_raw_fd()
+impl std::fmt::Display for UnmanagedResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This resource is not managed by Smithay.")
     }
 }
 
-/// With `AsRawFd` implemented, we can now implement `drm::Device`.
-impl Device for Card {}
-impl ControlDevice for Card {}
+impl std::error::Error for UnmanagedResource {}
 
-/// Simple helper methods for opening a `Card`.
-impl Card {
-    pub fn open(path: &str) -> Self {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        options.write(true);
-        Card(options.open(path).unwrap())
-    }
+/// This resource has been destroyed and can no longer be used.
+#[derive(Debug)]
+pub struct DeadResource;
 
-    pub fn open_global() -> Self {
-        let device = std::env::var("DEV").unwrap_or("/dev/dri/card0".to_string());
-        Self::open(&device)
+impl std::fmt::Display for DeadResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This resource has been destroyed and can no longer be used.")
     }
 }
 
-pub mod capabilities {
-    use drm_rs::ClientCapability as CC;
-    pub const CLIENT_CAP_ENUMS: &[CC] = &[CC::Stereo3D, CC::UniversalPlanes, CC::Atomic];
-
-    use drm_rs::DriverCapability as DC;
-    pub const DRIVER_CAP_ENUMS: &[DC] = &[
-        DC::DumbBuffer,
-        DC::VBlankHighCRTC,
-        DC::DumbPreferredDepth,
-        DC::DumbPreferShadow,
-        DC::Prime,
-        DC::MonotonicTimestamp,
-        DC::ASyncPageFlip,
-        DC::CursorWidth,
-        DC::CursorHeight,
-        DC::AddFB2Modifiers,
-        DC::PageFlipTarget,
-        DC::CRTCInVBlankEvent,
-        DC::SyncObj,
-    ];
-}
+impl std::error::Error for DeadResource {}

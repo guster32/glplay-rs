@@ -1,5 +1,3 @@
-
-  
 //! A safe interface to the Direct Rendering Manager subsystem found in various
 //! operating systems.
 //!
@@ -117,6 +115,19 @@ pub trait Device: AsRawFd {
         Ok(())
     }
 
+    /// Generates an [`AuthToken`] for this process.
+    #[deprecated(note = "Consider opening a render node instead.")]
+    fn generate_auth_token(&self) -> Result<AuthToken, SystemError> {
+        let token = drm_ffi::auth::get_magic_token(self.as_raw_fd())?;
+        Ok(AuthToken(token.magic))
+    }
+
+    /// Authenticates an [`AuthToken`] from another process.
+    fn authenticate_auth_token(&self, token: AuthToken) -> Result<(), SystemError> {
+        drm_ffi::auth::auth_magic_token(self.as_raw_fd(), token.0)?;
+        Ok(())
+    }
+
     /// Requests the driver to expose or hide certain capabilities. See
     /// [`ClientCapability`] for more information.
     fn set_client_capability(
@@ -144,6 +155,13 @@ pub trait Device: AsRawFd {
         let bus_id = BusID(SmallOsString::from_u8_buffer(buffer, buffer_len));
 
         Ok(bus_id)
+    }
+
+    /// Check to see if our [`AuthToken`] has been authenticated
+    /// by the DRM Master
+    fn authenticated(&self) -> Result<bool, SystemError> {
+        let client = drm_ffi::get_client(self.as_raw_fd(), 0)?;
+        Ok(client.auth == 1)
     }
 
     /// Gets the value of a capability.
@@ -192,6 +210,20 @@ pub trait Device: AsRawFd {
         Ok(driver)
     }
 }
+
+/// An authentication token, unique to the file descriptor of the device.
+///
+/// This token can be sent to another process that owns the DRM Master lock to
+/// allow unprivileged use of the device, such as rendering.
+///
+/// # Deprecation Notes
+///
+/// This method of authentication is somewhat deprecated. Accessing unprivileged
+/// functionality is best done by opening a render node. However, some other
+/// processes may still use this method of authentication. Therefore, we still
+/// provide functionality for generating and authenticating these tokens.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct AuthToken(u32);
 
 /// Bus ID of a device.
 #[allow(clippy::upper_case_acronyms)]

@@ -102,7 +102,7 @@ fn main() {
         .iter()
         .filter_map(|format| {
             println!("Format is: {:#?}", format);
-            if format.code == Fourcc::Xbgr8888 {
+            if format.code == Fourcc::Xbgr8888 || format.code.to_string() == "XR24" {
                 Some(format.modifier)
             } else {
                 None
@@ -113,6 +113,7 @@ fn main() {
     let mut swapchain = Swapchain::new(allocator, w.into(), h.into(), Fourcc::Xbgr8888, mods);
     let first_buffer: Slot<DumbBuffer<FdWrapper>> = swapchain.acquire().unwrap().unwrap();
     let framebuffer = surface.add_framebuffer(first_buffer.handle(), 24, 32).unwrap();
+    println!("framebuffer is: {:#?}", framebuffer);
     first_buffer.userdata().insert_if_missing(|| framebuffer);
 
     // Get the device as an allocator into the

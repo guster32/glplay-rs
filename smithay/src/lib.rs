@@ -46,23 +46,22 @@
 //! whether the `slog-stdlog` is enabled. If yes, the module will log to the global logger of the
 //! `log` crate. If not, the logs will discarded. This cargo feature is part of the default set of
 //! features of Smithay.
+pub use calloop;
+pub use drm_ffi;
+pub use libc;
+pub use slog;
+pub use once_cell;
+pub use drm_fourcc;
 
 #[doc(hidden)]
 pub extern crate nix;
 pub extern crate drm_rs as drm;
-pub extern crate drm_ffi;
 pub extern crate gbm_rs as gbm;
-pub extern crate calloop;
-pub extern crate libc;
-pub extern crate drm_fourcc;
 
 pub mod backend;
 pub mod utils;
 
 pub mod reexports;
-
-extern crate slog;
-extern crate once_cell;
 
 #[cfg(feature = "slog-stdlog")]
 #[allow(dead_code)]

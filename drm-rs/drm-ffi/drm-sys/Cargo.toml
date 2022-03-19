@@ -7,7 +7,7 @@ license = "MIT"
 build = "build.rs"
 
 [dependencies]
-libc = { version = "0.2.119"}
+libc = { version = "0.2.120"}
 
 [build-dependencies]
 bindgen = "0.59.2"

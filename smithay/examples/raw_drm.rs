@@ -2,11 +2,11 @@
 
 #[macro_use]
 extern crate slog;
-extern crate smithay;
+extern crate glplay_rs;
 
 use slog::Drain;
 
-pub use smithay::{
+pub use glplay_rs::{
     backend::{
         allocator::{dumb::DumbBuffer, Fourcc, Slot, Swapchain},
         drm::{DrmDevice, DrmEvent, DrmSurface},

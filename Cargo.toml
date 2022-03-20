@@ -8,14 +8,12 @@ repository = "https://github.com/guster32/glplay-rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-drm-rs = { path = "drm-rs", version = "0.0.1" }
-gbm-rs = { path = "gbm-rs", version = "0.0.1" }
+smithay = { path = "smithay" }
+slog = { version = "2.7.0" }
+slog-term = { version = "2.9.0" }
 
 [workspace]
 members = [
-    "drm-rs",
-    "drm-rs/drm-ffi",
-    "drm-rs/drm-ffi/drm-sys",
-    "gbm-rs",
-    "gbm-rs/gbm-sys",
+    "smithay"
 ]
+

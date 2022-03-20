@@ -4,29 +4,57 @@
 
 #![warn(missing_docs)]
 #![allow(unused_doc_comments)]
+extern crate core;
+
 pub extern crate drm_sys;
 pub use drm_sys::*;
 
+#[macro_use]
 extern crate nix;
 
 #[macro_use]
 pub(crate) mod utils;
 
 use result::SystemError as Error;
+pub mod gem;
 pub mod ioctl;
 pub mod mode;
 pub mod result;
 
+use nix::libc::*;
 use std::os::unix::io::RawFd;
 
 ///
 /// Bindings to the methods of authentication the DRM provides.
 ///
 pub mod auth {
+    use drm_sys::*;
     use ioctl;
 
     use nix::Error;
     use std::os::unix::io::RawFd;
+
+    /// Get the 'Magic Authentication Token' for this file descriptor.
+    pub fn get_magic_token(fd: RawFd) -> Result<drm_auth, Error> {
+        let mut auth = drm_auth::default();
+
+        unsafe {
+            ioctl::get_token(fd, &mut auth)?;
+        }
+
+        Ok(auth)
+    }
+
+    /// Authorize another process' 'Magic Authentication Token'.
+    pub fn auth_magic_token(fd: RawFd, auth: u32) -> Result<drm_auth, Error> {
+        let token = drm_auth { magic: auth };
+
+        unsafe {
+            ioctl::auth_token(fd, &token)?;
+        }
+
+        Ok(token)
+    }
 
     /// Acquire the 'Master DRM Lock' for this file descriptor.
     pub fn acquire_master(fd: RawFd) -> Result<(), Error> {
@@ -64,6 +92,41 @@ pub fn get_bus_id(fd: RawFd, buf: Option<&mut &mut [u8]>) -> Result<drm_unique, 
     map_shrink!(buf, busid.unique_len as usize);
 
     Ok(busid)
+}
+
+/// Get a device's IRQ.
+pub fn get_interrupt_from_bus_id(
+    fd: RawFd,
+    bus: c_int,
+    dev: c_int,
+    func: c_int,
+) -> Result<drm_irq_busid, Error> {
+    let mut irq = drm_irq_busid {
+        busnum: bus,
+        devnum: dev,
+        funcnum: func,
+        ..Default::default()
+    };
+
+    unsafe {
+        ioctl::get_irq_from_bus_id(fd, &mut irq)?;
+    }
+
+    Ok(irq)
+}
+
+/// Get client information given a client's ID.
+pub fn get_client(fd: RawFd, idx: c_int) -> Result<drm_client, Error> {
+    let mut client = drm_client {
+        idx,
+        ..Default::default()
+    };
+
+    unsafe {
+        ioctl::get_client(fd, &mut client)?;
+    }
+
+    Ok(client)
 }
 
 /// Check if a capability is set.

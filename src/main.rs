@@ -155,7 +155,7 @@ impl VBlankHandler {
             // Next buffer
             let next = self.swapchain.acquire().unwrap().unwrap();
             if next.userdata().get::<framebuffer::Handle>().is_none() {
-                let fb = self.surface.add_framebuffer(next.handle(), 32, 32).unwrap();
+                let fb = self.surface.add_framebuffer(next.handle(), 24, 32).unwrap();
                 next.userdata().insert_if_missing(|| fb);
             }
 

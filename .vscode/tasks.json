@@ -1,0 +1,155 @@
+{
+  /* Configure integrated VS Code Terminal */
+  "presentation": {
+    "echo": false,
+    "reveal": "always",
+    "focus": true,
+    "panel": "dedicated",
+    "showReuseMessage": true,
+  },
+  "tasks": [
+    {
+      "label": "CrossBuildDeployAndRemoteDebug",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "CrossBuild",
+        "CrossDeploy",
+        "RemoteDebug"
+      ]
+    },
+    {
+      "label": "CrossBuildDeployAndRemoteDebugOdroidXU4",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "CrossBuildOdroidXU4",
+        "CrossDeployOdroidXU4",
+        "RemoteDebugOdroidXU4"
+      ]
+    },
+    {
+      "label": "RemoteDebug",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/launchRemoteGDB.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "SRC_DIR": "${workspaceFolder}",
+          "TARGET_IP": "${config:ARCADIA_QEMU.TARGET_IP}",
+          "TARGET_SCP_PORT": "${config:ARCADIA_QEMU.TARGET_SCP_PORT}",
+          "PROGRAM":"${config:ARCADIA_QEMU.PROGRAM}",
+        }
+      }
+    },
+    {
+      "label": "RemoteDebugOdroidXU4",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/launchRemoteGDB.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "SRC_DIR": "${workspaceFolder}",
+          "TARGET_IP": "${config:ARCADIA_ODROIDXU4.TARGET_IP}",
+          "TARGET_SCP_PORT": "${config:ARCADIA_ODROIDXU4.TARGET_SCP_PORT}",
+          "PROGRAM":"${config:ARCADIA_QEMU.PROGRAM}",
+        }
+      }
+    },
+    {
+      "label": "CrossBuild",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/build.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "SRC_DIR": "${workspaceFolder}",
+          "ENVIRONMENT_SCRIPT": "${config:ARCADIA_QEMU.ENVIRONMENT_SCRIPT}",
+          "OECORE_NATIVE_SYSROOT": "${config:ARCADIA_QEMU.OECORE_NATIVE_SYSROOT}",
+          "SDKTARGETSYSROOT": "${config:ARCADIA_QEMU.SDKTARGETSYSROOT}",
+          "RUST_TARGET": "${config:ARCADIA_QEMU.RUST_TARGET}",
+          "DYNAMIC_LINKER": "${config:ARCADIA_QEMU.DYNAMIC_LINKER}",
+          "LINKER": "${config:ARCADIA_QEMU.LINKER}",
+        }
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "CrossBuildOdroidXU4",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/build.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "SRC_DIR": "${workspaceFolder}",
+          "ENVIRONMENT_SCRIPT": "${config:ARCADIA_ODROIDXU4.ENVIRONMENT_SCRIPT}",
+          "OECORE_NATIVE_SYSROOT": "${config:ARCADIA_ODROIDXU4.OECORE_NATIVE_SYSROOT}",
+          "SDKTARGETSYSROOT": "${config:ARCADIA_ODROIDXU4.SDKTARGETSYSROOT}",
+          "RUST_TARGET": "${config:ARCADIA_ODROIDXU4.RUST_TARGET}",
+          "DYNAMIC_LINKER": "${config:ARCADIA_ODROIDXU4.DYNAMIC_LINKER}",
+          "LINKER": "${config:ARCADIA_ODROIDXU4.LINKER}",
+        }
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "CrossDeploy",
+      "type": "shell",
+      "command": "scp",
+      "args": [
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-P",
+        "${config:ARCADIA_QEMU.TARGET_SCP_PORT}",
+        "${workspaceFolder}/target/x86_64-arcadia-linux-gnu/debug/${config:ARCADIA_QEMU.PROGRAM}",
+        "${config:ARCADIA_QEMU.TARGET_USER}@${config:ARCADIA_QEMU.TARGET_IP}:/home/${config:ARCADIA_QEMU.TARGET_USER}/${config:ARCADIA_QEMU.PROGRAM}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/"
+      }
+    },
+    {
+      "label": "CrossDeployOdroidXU4",
+      "type": "shell",
+      "command": "scp",
+      "args": [
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-P",
+        "${config:ARCADIA_ODROIDXU4.TARGET_SCP_PORT}",
+        "${workspaceFolder}/target/armv7-arcadia-linux-gnueabihf/debug/${config:ARCADIA_ODROIDXU4.PROGRAM}",
+        "${config:ARCADIA_ODROIDXU4.TARGET_USER}@${config:ARCADIA_ODROIDXU4.TARGET_IP}:/home/${config:ARCADIA_ODROIDXU4.TARGET_USER}/${config:ARCADIA_ODROIDXU4.PROGRAM}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/"
+      }
+    },
+  ],
+  "version": "2.0.0"
+}

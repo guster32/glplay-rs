@@ -43,6 +43,52 @@
             },
             "args": [],
             "cwd": "${workspaceFolder}"
-        }
+        },
+        {
+            "name": "RemoteDebug",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/x86_64-arcadia-linux-gnu/debug/${config:ARCADIA_QEMU.PROGRAM}",
+            "miDebuggerServerAddress": "${config:ARCADIA_QEMU.TARGET_IP}:${config:ARCADIA_QEMU.TARGET_GDB_PORT}",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}",
+            "environment": [],
+            "externalConsole": true,
+            "linux": {
+              "MIMode": "gdb"
+            },
+            "preLaunchTask": "CrossBuildDeployAndRemoteDebug",
+            "setupCommands": [
+              {
+                  "description": "Enable pretty-printing for gdb",
+                  "text": "-enable-pretty-printing",
+                  "ignoreFailures": true
+              }
+          ]
+        },
+        {
+            "name": "RemoteDebugOdroidXU4",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/armv7-arcadia-linux-gnueabihf/debug/${config:ARCADIA_ODROIDXU4.PROGRAM}",
+            "miDebuggerServerAddress": "${config:ARCADIA_ODROIDXU4.TARGET_IP}:${config:ARCADIA_ODROIDXU4.TARGET_GDB_PORT}",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceRoot}",
+            "environment": [],
+            "externalConsole": true,
+            "linux": {
+              "MIMode": "gdb"
+            },
+            "preLaunchTask": "CrossBuildDeployAndRemoteDebugOdroidXU4",
+            "setupCommands": [
+              {
+                  "description": "Enable pretty-printing for gdb",
+                  "text": "-enable-pretty-printing",
+                  "ignoreFailures": true
+              }
+          ]
+        },
     ]
 }

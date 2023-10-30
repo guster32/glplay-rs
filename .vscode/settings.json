@@ -42,4 +42,6 @@
     "LINKER":"arm-arcadia-linux-gnueabi-gcc",
     "RUST_TARGET":"armv7-arcadia-linux-gnueabihf",
   },
+  "rust-analyzer.checkOnSave": true,
+  "editor.formatOnSave": true,
 }

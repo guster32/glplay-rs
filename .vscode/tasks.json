@@ -133,6 +133,24 @@
       }
     },
     {
+      "label": "CrossDeployDrm",
+      "type": "shell",
+      "command": "scp",
+      "args": [
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-P",
+        "${config:ARCADIA_QEMU.TARGET_SCP_PORT}",
+        "${workspaceFolder}/target/x86_64-arcadia-linux-gnu/debug/drm",
+        "${config:ARCADIA_QEMU.TARGET_USER}@${config:ARCADIA_QEMU.TARGET_IP}:/home/${config:ARCADIA_QEMU.TARGET_USER}/drm"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/"
+      }
+    },
+    {
       "label": "CrossDeployOdroidXU4",
       "type": "shell",
       "command": "scp",

@@ -34,12 +34,16 @@ extern crate drm_ffi;
 extern crate drm_fourcc;
 extern crate nix;
 
+extern crate bytemuck;
+
 pub(crate) mod util;
 
 pub mod buffer;
 pub mod control;
 
-use std::os::unix::io::AsRawFd;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::{ffi::OsStringExt, io::AsFd};
+use std::time::Duration;
 
 pub use drm_ffi::result::SystemError;
 use util::*;
@@ -62,23 +66,23 @@ use util::*;
 /// use std::fs::File;
 /// use std::fs::OpenOptions;
 ///
-/// use std::os::unix::io::RawFd;
-/// use std::os::unix::io::AsRawFd;
+/// use std::os::unix::io::AsFd;
+/// use std::os::unix::io::BorrowedFd;
 ///
 /// #[derive(Debug)]
 /// /// A simple wrapper for a device node.
 /// struct Card(File);
 ///
-/// /// Implementing [`AsRawFd`] is a prerequisite to implementing the traits found
-/// /// in this crate. Here, we are just calling [`File::as_raw_fd()`] on the inner
+/// /// Implementing [`AsFd`] is a prerequisite to implementing the traits found
+/// /// in this crate. Here, we are just calling [`File::as_fd()`] on the inner
 /// /// [`File`].
-/// impl AsRawFd for Card {
-///     fn as_raw_fd(&self) -> RawFd {
-///         self.0.as_raw_fd()
+/// impl AsFd for Card {
+///     fn as_fd(&self) -> BorrowedFd<'_> {
+///         self.0.as_fd()
 ///     }
 /// }
 ///
-/// /// With [`AsRawFd`] implemented, we can now implement [`drm::Device`].
+/// /// With [`AsFd`] implemented, we can now implement [`drm::Device`].
 /// impl Device for Card {}
 ///
 /// impl Card {
@@ -93,7 +97,7 @@ use util::*;
 ///     }
 /// }
 /// ```
-pub trait Device: AsRawFd {
+pub trait Device: AsFd {
     /// Acquires the DRM Master lock for this process.
     ///
     /// # Notes
@@ -105,26 +109,26 @@ pub trait Device: AsRawFd {
     /// This function is only available to processes with CAP_SYS_ADMIN
     /// privileges (usually as root)
     fn acquire_master_lock(&self) -> Result<(), SystemError> {
-        drm_ffi::auth::acquire_master(self.as_raw_fd())?;
+        drm_ffi::auth::acquire_master(self.as_fd())?;
         Ok(())
     }
 
     /// Releases the DRM Master lock for another process to use.
     fn release_master_lock(&self) -> Result<(), SystemError> {
-        drm_ffi::auth::release_master(self.as_raw_fd())?;
+        drm_ffi::auth::release_master(self.as_fd())?;
         Ok(())
     }
 
     /// Generates an [`AuthToken`] for this process.
     #[deprecated(note = "Consider opening a render node instead.")]
     fn generate_auth_token(&self) -> Result<AuthToken, SystemError> {
-        let token = drm_ffi::auth::get_magic_token(self.as_raw_fd())?;
+        let token = drm_ffi::auth::get_magic_token(self.as_fd())?;
         Ok(AuthToken(token.magic))
     }
 
     /// Authenticates an [`AuthToken`] from another process.
     fn authenticate_auth_token(&self, token: AuthToken) -> Result<(), SystemError> {
-        drm_ffi::auth::auth_magic_token(self.as_raw_fd(), token.0)?;
+        drm_ffi::auth::auth_magic_token(self.as_fd(), token.0)?;
         Ok(())
     }
 
@@ -135,24 +139,15 @@ pub trait Device: AsRawFd {
         cap: ClientCapability,
         enable: bool,
     ) -> Result<(), SystemError> {
-        drm_ffi::set_capability(self.as_raw_fd(), cap as u64, enable)?;
+        drm_ffi::set_capability(self.as_fd(), cap as u64, enable)?;
         Ok(())
     }
 
-    /// Gets the [`BusID`] of this device.
-    fn get_bus_id(&self) -> Result<BusID, SystemError> {
-        let mut buffer = [0u8; 32];
-
-        let buffer_len;
-
-        let _busid = {
-            let mut slice = &mut buffer[..];
-            let busid = drm_ffi::get_bus_id(self.as_raw_fd(), Some(&mut slice))?;
-            buffer_len = slice.len();
-            busid
-        };
-
-        let bus_id = BusID(SmallOsString::from_u8_buffer(buffer, buffer_len));
+    /// Gets the bus ID of this device.
+    fn get_bus_id(&self) -> Result<OsString, SystemError> {
+        let mut buffer = Vec::new();
+        let _ = drm_ffi::get_bus_id(self.as_fd(), Some(&mut buffer))?;
+        let bus_id = OsString::from_vec(buffer);
 
         Ok(bus_id)
     }
@@ -160,13 +155,13 @@ pub trait Device: AsRawFd {
     /// Check to see if our [`AuthToken`] has been authenticated
     /// by the DRM Master
     fn authenticated(&self) -> Result<bool, SystemError> {
-        let client = drm_ffi::get_client(self.as_raw_fd(), 0)?;
+        let client = drm_ffi::get_client(self.as_fd(), 0)?;
         Ok(client.auth == 1)
     }
 
     /// Gets the value of a capability.
     fn get_driver_capability(&self, cap: DriverCapability) -> Result<u64, SystemError> {
-        let cap = drm_ffi::get_capability(self.as_raw_fd(), cap as u64)?;
+        let cap = drm_ffi::get_capability(self.as_fd(), cap as u64)?;
         Ok(cap.value)
     }
 
@@ -174,40 +169,63 @@ pub trait Device: AsRawFd {
     ///   - [`SystemError::MemoryFault`]: Kernel could not copy fields into userspace
     #[allow(missing_docs)]
     fn get_driver(&self) -> Result<Driver, SystemError> {
-        let mut name = [0i8; 32];
-        let mut date = [0i8; 32];
-        let mut desc = [0i8; 32];
+        let mut name = Vec::new();
+        let mut date = Vec::new();
+        let mut desc = Vec::new();
 
-        let name_len;
-        let date_len;
-        let desc_len;
+        let _ = drm_ffi::get_version(
+            self.as_fd(),
+            Some(&mut name),
+            Some(&mut date),
+            Some(&mut desc),
+        )?;
 
-        let _version = {
-            let mut name_slice = &mut name[..];
-            let mut date_slice = &mut date[..];
-            let mut desc_slice = &mut desc[..];
-
-            let version = drm_ffi::get_version(
-                self.as_raw_fd(),
-                Some(&mut name_slice),
-                Some(&mut date_slice),
-                Some(&mut desc_slice),
-            )?;
-
-            name_len = name_slice.len();
-            date_len = date_slice.len();
-            desc_len = desc_slice.len();
-
-            version
-        };
-
-        let name = SmallOsString::from_i8_buffer(name, name_len);
-        let date = SmallOsString::from_i8_buffer(date, date_len);
-        let desc = SmallOsString::from_i8_buffer(desc, desc_len);
+        let name = OsString::from_vec(unsafe { transmute_vec(name) });
+        let date = OsString::from_vec(unsafe { transmute_vec(date) });
+        let desc = OsString::from_vec(unsafe { transmute_vec(desc) });
 
         let driver = Driver { name, date, desc };
 
         Ok(driver)
+    }
+
+    /// Waits for a vblank.
+    fn wait_vblank(
+        &self,
+        target_sequence: VblankWaitTarget,
+        flags: VblankWaitFlags,
+        high_crtc: u32,
+        user_data: usize,
+    ) -> Result<VblankWaitReply, SystemError> {
+        use drm_ffi::drm_vblank_seq_type::_DRM_VBLANK_HIGH_CRTC_MASK;
+        use drm_ffi::_DRM_VBLANK_HIGH_CRTC_SHIFT;
+
+        let high_crtc_mask = _DRM_VBLANK_HIGH_CRTC_MASK >> _DRM_VBLANK_HIGH_CRTC_SHIFT;
+        if (high_crtc & !high_crtc_mask) != 0 {
+            return Err(SystemError::InvalidArgument);
+        }
+
+        let (sequence, wait_type) = match target_sequence {
+            VblankWaitTarget::Absolute(n) => {
+                (n, drm_ffi::drm_vblank_seq_type::_DRM_VBLANK_ABSOLUTE)
+            }
+            VblankWaitTarget::Relative(n) => {
+                (n, drm_ffi::drm_vblank_seq_type::_DRM_VBLANK_RELATIVE)
+            }
+        };
+
+        let type_ = wait_type | (high_crtc << _DRM_VBLANK_HIGH_CRTC_SHIFT) | flags.bits();
+        let reply = drm_ffi::wait_vblank(self.as_fd(), type_, sequence, user_data)?;
+
+        let time = match (reply.tval_sec, reply.tval_usec) {
+            (0, 0) => None,
+            (sec, usec) => Some(Duration::new(sec as u64, (usec * 1000) as u32)),
+        };
+
+        Ok(VblankWaitReply {
+            frame: reply.sequence,
+            time,
+        })
     }
 }
 
@@ -225,23 +243,15 @@ pub trait Device: AsRawFd {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AuthToken(u32);
 
-/// Bus ID of a device.
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct BusID(SmallOsString);
-
-impl AsRef<OsStr> for BusID {
-    fn as_ref(&self) -> &OsStr {
-        self.0.as_ref()
-    }
-}
-
 /// Driver version of a device.
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Driver {
-    name: SmallOsString,
-    date: SmallOsString,
-    desc: SmallOsString,
+    /// Name of the driver
+    pub name: OsString,
+    /// Date driver was published
+    pub date: OsString,
+    /// Driver description
+    pub desc: OsString,
 }
 
 impl Driver {
@@ -292,6 +302,8 @@ pub enum DriverCapability {
     CRTCInVBlankEvent = drm_ffi::DRM_CAP_CRTC_IN_VBLANK_EVENT as u64,
     /// SyncObj support
     SyncObj = drm_ffi::DRM_CAP_SYNCOBJ as u64,
+    /// Timeline SyncObj support
+    TimelineSyncObj = drm_ffi::DRM_CAP_SYNCOBJ_TIMELINE as u64,
 }
 
 /// Used to enable/disable capabilities for the process.
@@ -304,4 +316,44 @@ pub enum ClientCapability {
     UniversalPlanes = drm_ffi::DRM_CLIENT_CAP_UNIVERSAL_PLANES as u64,
     /// The driver provides atomic modesetting
     Atomic = drm_ffi::DRM_CLIENT_CAP_ATOMIC as u64,
+}
+
+/// Used to specify a vblank sequence to wait for
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum VblankWaitTarget {
+    /// Wait for a specific vblank sequence number
+    Absolute(u32),
+    /// Wait for a given number of vblanks
+    Relative(u32),
+}
+
+bitflags::bitflags! {
+    /// Flags to alter the behaviour when waiting for a vblank
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct VblankWaitFlags : u32 {
+        /// Send event instead of blocking
+        const EVENT = drm_ffi::drm_vblank_seq_type::_DRM_VBLANK_EVENT;
+        /// If missed, wait for next vblank
+        const NEXT_ON_MISS = drm_ffi::drm_vblank_seq_type::_DRM_VBLANK_NEXTONMISS;
+    }
+}
+
+/// Data returned from a vblank wait
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct VblankWaitReply {
+    frame: u32,
+    time: Option<Duration>,
+}
+
+impl VblankWaitReply {
+    /// Sequence of the frame
+    pub fn frame(&self) -> u32 {
+        self.frame
+    }
+
+    /// Time at which the vblank occurred. [`None`] if an asynchronous event was
+    /// requested
+    pub fn time(&self) -> Option<Duration> {
+        self.time
+    }
 }

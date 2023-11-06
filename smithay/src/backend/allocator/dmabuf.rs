@@ -1,4 +1,4 @@
-//! Module for [dmabuf](https://01.org/linuxgraphics/gfx-docs/drm/driver-api/dma-buf.html) buffers.
+//! Module for [dmabuf](https://docs.kernel.org/driver-api/dma-buf.html) buffers.
 //!
 //! `Dmabuf`s act alike to smart pointers and can be freely cloned and passed around.
 //! Once the last `Dmabuf` reference is dropped, its file descriptor is closed and
@@ -10,11 +10,16 @@
 //! This can be especially useful in resources where other parts of the stack should decide upon
 //! the lifetime of the buffer. E.g. when you are only caching associated resources for a dmabuf.
 
-use super::{Buffer, Format, Fourcc, Modifier};
+use calloop::generic::Generic;
+use calloop::{EventSource, Interest, Mode, PostAction};
+
+use super::{Allocator, Buffer, Format, Fourcc, Modifier};
 use crate::utils::{Buffer as BufferCoords, Size};
 use std::hash::{Hash, Hasher};
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::{error, fmt};
 
 /// Maximum amount of planes this implementation supports
 pub const MAX_PLANES: usize = 4;
@@ -35,7 +40,7 @@ pub(crate) struct DmabufInternal {
 
 #[derive(Debug)]
 pub(crate) struct Plane {
-    pub fd: Option<RawFd>,
+    pub fd: OwnedFd,
     /// The plane index
     pub plane_idx: u32,
     /// Offset from the start of the Fd
@@ -46,22 +51,15 @@ pub(crate) struct Plane {
     pub modifier: Modifier,
 }
 
-impl IntoRawFd for Plane {
-    fn into_raw_fd(mut self) -> RawFd {
-        self.fd.take().unwrap()
-    }
-}
-
-impl Drop for Plane {
-    fn drop(&mut self) {
-        if let Some(fd) = self.fd.take() {
-            let _ = nix::unistd::close(fd);
-        }
+impl From<Plane> for OwnedFd {
+    fn from(plane: Plane) -> OwnedFd {
+        plane.fd
     }
 }
 
 bitflags::bitflags! {
     /// Possible flags for a DMA buffer
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct DmabufFlags: u32 {
         /// The buffer content is Y-inverted
         const Y_INVERT = 1;
@@ -79,6 +77,19 @@ pub struct Dmabuf(pub(crate) Arc<DmabufInternal>);
 #[derive(Debug, Clone)]
 /// Weak reference to a dmabuf handle
 pub struct WeakDmabuf(pub(crate) Weak<DmabufInternal>);
+
+// A reference to a particular dmabuf plane fd, so it can be used as a calloop source.
+#[derive(Debug)]
+struct PlaneRef {
+    dmabuf: Dmabuf,
+    idx: usize,
+}
+
+impl AsFd for PlaneRef {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.dmabuf.0.planes[self.idx].fd.as_fd()
+    }
+}
 
 impl PartialEq for Dmabuf {
     fn eq(&self, other: &Self) -> bool {
@@ -129,12 +140,19 @@ impl DmabufBuilder {
     ///
     /// *Note*: Each Dmabuf needs at least one plane.
     /// MAX_PLANES notes the maximum amount of planes any format may use with this implementation.
-    pub fn add_plane(&mut self, fd: RawFd, idx: u32, offset: u32, stride: u32, modifier: Modifier) -> bool {
+    pub fn add_plane(
+        &mut self,
+        fd: OwnedFd,
+        idx: u32,
+        offset: u32,
+        stride: u32,
+        modifier: Modifier,
+    ) -> bool {
         if self.internal.planes.len() == MAX_PLANES {
             return false;
         }
         self.internal.planes.push(Plane {
-            fd: Some(fd),
+            fd,
             plane_idx: idx,
             offset,
             stride,
@@ -196,8 +214,8 @@ impl Dmabuf {
     }
 
     /// Returns raw handles of the planes of this buffer
-    pub fn handles(&self) -> impl Iterator<Item = RawFd> + '_ {
-        self.0.planes.iter().map(|p| *p.fd.as_ref().unwrap())
+    pub fn handles(&self) -> impl Iterator<Item = BorrowedFd<'_>> + '_ {
+        self.0.planes.iter().map(|p| p.fd.as_fd())
     }
 
     /// Returns offsets for the planes of this buffer
@@ -212,7 +230,8 @@ impl Dmabuf {
 
     /// Returns if this buffer format has any vendor-specific modifiers set or is implicit/linear
     pub fn has_modifier(&self) -> bool {
-        self.0.planes[0].modifier != Modifier::Invalid && self.0.planes[0].modifier != Modifier::Linear
+        self.0.planes[0].modifier != Modifier::Invalid
+            && self.0.planes[0].modifier != Modifier::Linear
     }
 
     /// Returns if the buffer is stored inverted on the y-axis
@@ -224,6 +243,20 @@ impl Dmabuf {
     pub fn weak(&self) -> WeakDmabuf {
         WeakDmabuf(Arc::downgrade(&self.0))
     }
+
+    /// Create an [`calloop::EventSource`] and [`crate::wayland::compositor::Blocker`] for this [`Dmabuf`].
+    ///
+    /// Usually used to block applying surface state on the readiness of an attached dmabuf.
+    #[cfg(feature = "wayland_frontend")]
+    #[profiling::function]
+    pub fn generate_blocker(
+        &self,
+        interest: Interest,
+    ) -> Result<(DmabufBlocker, DmabufSource), AlreadyReady> {
+        let source = DmabufSource::new(self.clone(), interest)?;
+        let blocker = DmabufBlocker(source.signal.clone());
+        Ok((blocker, source))
+    }
 }
 
 impl WeakDmabuf {
@@ -233,12 +266,17 @@ impl WeakDmabuf {
     pub fn upgrade(&self) -> Option<Dmabuf> {
         self.0.upgrade().map(Dmabuf)
     }
+
+    /// Returns true if there are not any strong references remaining
+    pub fn is_gone(&self) -> bool {
+        self.0.strong_count() == 0
+    }
 }
 
 /// Buffer that can be exported as Dmabufs
 pub trait AsDmabuf {
     /// Error type returned, if exporting fails
-    type Error;
+    type Error: std::error::Error;
 
     /// Export this buffer as a new Dmabuf
     fn export(&self) -> Result<Dmabuf, Self::Error>;
@@ -249,5 +287,254 @@ impl AsDmabuf for Dmabuf {
 
     fn export(&self) -> Result<Dmabuf, std::convert::Infallible> {
         Ok(self.clone())
+    }
+}
+
+/// Type erased error
+#[derive(Debug)]
+pub struct AnyError(Box<dyn error::Error + Send + Sync>);
+
+impl fmt::Display for AnyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl error::Error for AnyError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// Wrapper for Allocators, whos buffer types implement [`AsDmabuf`].
+///
+/// Implements `Allocator<Buffer=Dmabuf, Error=AnyError>`
+#[derive(Debug)]
+pub struct DmabufAllocator<A>(pub A)
+where
+    A: Allocator,
+    <A as Allocator>::Buffer: AsDmabuf + 'static,
+    <A as Allocator>::Error: 'static;
+
+impl<A> Allocator for DmabufAllocator<A>
+where
+    A: Allocator,
+    <A as Allocator>::Buffer: AsDmabuf + 'static,
+    <A as Allocator>::Error: Send + Sync + 'static,
+    <<A as Allocator>::Buffer as AsDmabuf>::Error: Send + Sync + 'static,
+{
+    type Buffer = Dmabuf;
+    type Error = AnyError;
+
+    #[profiling::function]
+    fn create_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        fourcc: Fourcc,
+        modifiers: &[Modifier],
+    ) -> Result<Self::Buffer, Self::Error> {
+        self.0
+            .create_buffer(width, height, fourcc, modifiers)
+            .map_err(|err| AnyError(err.into()))
+            .and_then(|b| AsDmabuf::export(&b).map_err(|err| AnyError(err.into())))
+    }
+}
+
+/// [`crate::wayland::compositor::Blocker`] implementation for an accompaning [`DmabufSource`]
+#[cfg(feature = "wayland_frontend")]
+#[derive(Debug)]
+pub struct DmabufBlocker(Arc<AtomicBool>);
+
+#[cfg(feature = "wayland_frontend")]
+impl Blocker for DmabufBlocker {
+    fn state(&self) -> BlockerState {
+        if self.0.load(Ordering::SeqCst) {
+            BlockerState::Released
+        } else {
+            BlockerState::Pending
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Subsource {
+    Active(Generic<PlaneRef, std::io::Error>),
+    Done(Generic<PlaneRef, std::io::Error>),
+    Empty,
+}
+
+impl Subsource {
+    fn done(&mut self) {
+        let mut this = Subsource::Empty;
+        std::mem::swap(self, &mut this);
+        match this {
+            Subsource::Done(source) | Subsource::Active(source) => {
+                *self = Subsource::Done(source);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// [`Dmabuf`]-based event source. Can be used to monitor implicit fences of a dmabuf.
+#[derive(Debug)]
+pub struct DmabufSource {
+    dmabuf: Dmabuf,
+    signal: Arc<AtomicBool>,
+    sources: [Subsource; 4],
+}
+
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[error("Dmabuf is already ready for the given interest")]
+/// Dmabuf is already ready for the given interest
+pub struct AlreadyReady;
+
+impl DmabufSource {
+    /// Creates a new [`DmabufSource`] from a [`Dmabuf`] and interest.
+    ///
+    /// This event source will monitor the implicit fences of the given dmabuf.
+    /// Monitoring for READ-access will monitor the state of the most recent write or exclusive fence.
+    /// Monitoring for WRITE-access, will monitor state of all attached fences, shared and exclusive ones.
+    ///
+    /// The event source is a one shot event source and will remove itself from the event loop after being triggered once.
+    /// To monitor for new fences added at a later time a new DmabufSource needs to be created.
+    ///
+    /// Returns `AlreadyReady` if all corresponding fences are already signalled or if `interest` is empty.
+    #[profiling::function]
+    pub fn new(dmabuf: Dmabuf, interest: Interest) -> Result<Self, AlreadyReady> {
+        if !interest.readable && !interest.writable {
+            return Err(AlreadyReady);
+        }
+
+        let mut sources = [
+            Subsource::Empty,
+            Subsource::Empty,
+            Subsource::Empty,
+            Subsource::Empty,
+        ];
+        for (idx, handle) in dmabuf.handles().enumerate() {
+            if matches!(
+                rustix::event::poll(
+                    &mut [rustix::event::PollFd::new(
+                        &handle,
+                        if interest.writable {
+                            rustix::event::PollFlags::OUT
+                        } else {
+                            rustix::event::PollFlags::IN
+                        },
+                    )],
+                    0
+                ),
+                Ok(1)
+            ) {
+                continue;
+            }
+            let fd = PlaneRef {
+                dmabuf: dmabuf.clone(),
+                idx,
+            };
+            sources[idx] = Subsource::Active(Generic::new(fd, interest, Mode::OneShot));
+        }
+        if sources
+            .iter()
+            .all(|x| matches!(x, Subsource::Done(_) | Subsource::Empty))
+        {
+            Err(AlreadyReady)
+        } else {
+            Ok(DmabufSource {
+                dmabuf,
+                sources,
+                signal: Arc::new(AtomicBool::new(false)),
+            })
+        }
+    }
+}
+
+impl EventSource for DmabufSource {
+    type Event = ();
+    type Metadata = Dmabuf;
+    type Ret = Result<(), std::io::Error>;
+
+    type Error = std::io::Error;
+
+    #[profiling::function]
+    fn process_events<F>(
+        &mut self,
+        readiness: calloop::Readiness,
+        token: calloop::Token,
+        mut callback: F,
+    ) -> Result<PostAction, Self::Error>
+    where
+        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
+    {
+        for i in 0..4 {
+            if let Ok(PostAction::Remove) =
+                if let Subsource::Active(ref mut source) = &mut self.sources[i] {
+                    // luckily Generic skips events for other tokens
+                    source.process_events(readiness, token, |_, _| Ok(PostAction::Remove))
+                } else {
+                    Ok(PostAction::Continue)
+                }
+            {
+                self.sources[i].done();
+            }
+        }
+
+        if self
+            .sources
+            .iter()
+            .all(|x| matches!(x, Subsource::Done(_) | Subsource::Empty))
+        {
+            self.signal.store(true, Ordering::SeqCst);
+            callback((), &mut self.dmabuf)?;
+            Ok(PostAction::Remove)
+        } else {
+            Ok(PostAction::Reregister)
+        }
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut calloop::Poll,
+        token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        for source in self.sources.iter_mut().filter_map(|source| match source {
+            Subsource::Active(ref mut source) => Some(source),
+            _ => None,
+        }) {
+            source.register(poll, token_factory)?;
+        }
+        Ok(())
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut calloop::Poll,
+        token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        for source in self.sources.iter_mut() {
+            match source {
+                Subsource::Active(ref mut source) => source.reregister(poll, token_factory)?,
+                Subsource::Done(ref mut source) => {
+                    let _ = source.unregister(poll);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn unregister(&mut self, poll: &mut calloop::Poll) -> calloop::Result<()> {
+        for source in self.sources.iter_mut() {
+            match source {
+                Subsource::Active(ref mut source) => source.unregister(poll)?,
+                Subsource::Done(ref mut source) => {
+                    let _ = source.unregister(poll);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }

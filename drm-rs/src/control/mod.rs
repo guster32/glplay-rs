@@ -30,7 +30,9 @@
 
 use drm_ffi as ffi;
 use drm_ffi::result::SystemError;
-use drm_fourcc::DrmModifier;
+use drm_fourcc::{DrmFourcc, DrmModifier, UnrecognizedFourcc};
+
+use bytemuck::allocation::TransparentWrapperAlloc;
 
 pub mod atomic;
 pub mod connector;
@@ -39,20 +41,33 @@ pub mod dumbbuffer;
 pub mod encoder;
 pub mod framebuffer;
 pub mod plane;
+pub mod syncobj;
 
 pub mod property;
 
 use self::dumbbuffer::*;
 use buffer;
 
+use super::util::*;
+
+use std::collections::HashMap;
+use std::convert::TryFrom;
+use std::iter::Zip;
 use std::mem;
-use std::os::unix::io::RawFd;
+use std::num::NonZeroUsize;
+use std::ops::RangeBounds;
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use core::num::NonZeroU32;
 
+pub use nix::fcntl::OFlag;
+
 /// Raw handle for a drm resource
 pub type RawResourceHandle = NonZeroU32;
+
+/// Id of a Lease
+pub type LeaseId = NonZeroU32;
 
 /// Handle for a drm resource
 pub trait ResourceHandle:
@@ -65,7 +80,7 @@ pub trait ResourceHandle:
 /// Convert from a raw drm object value to a typed Handle
 ///
 /// Note: This does no verification on the validity of the original value
-pub fn from_u32<T: ResourceHandle>(raw: u32) -> Option<T> {
+pub fn from_u32<T: From<RawResourceHandle>>(raw: u32) -> Option<T> {
     RawResourceHandle::new(raw).map(T::from)
 }
 
@@ -85,76 +100,68 @@ pub fn from_u32<T: ResourceHandle>(raw: u32) -> Option<T> {
 pub trait Device: super::Device {
     /// Gets the set of resource handles that this device currently controls
     fn resource_handles(&self) -> Result<ResourceHandles, SystemError> {
-        let mut fbs = [0u32; 32];
-        let mut crtcs = [0u32; 32];
-        let mut connectors = [0u32; 32];
-        let mut encoders = [0u32; 32];
-
-        let mut fb_slice = &mut fbs[..];
-        let mut crtc_slice = &mut crtcs[..];
-        let mut conn_slice = &mut connectors[..];
-        let mut enc_slice = &mut encoders[..];
+        let mut fbs = Vec::new();
+        let mut crtcs = Vec::new();
+        let mut connectors = Vec::new();
+        let mut encoders = Vec::new();
 
         let ffi_res = ffi::mode::get_resources(
-            self.as_raw_fd(),
-            Some(&mut fb_slice),
-            Some(&mut crtc_slice),
-            Some(&mut conn_slice),
-            Some(&mut enc_slice),
+            self.as_fd(),
+            Some(&mut fbs),
+            Some(&mut crtcs),
+            Some(&mut connectors),
+            Some(&mut encoders),
         )?;
 
-        let fb_len = fb_slice.len();
-        let crtc_len = crtc_slice.len();
-        let conn_len = conn_slice.len();
-        let enc_len = enc_slice.len();
-
-        let res = ResourceHandles {
-            fbs: unsafe { mem::transmute(fbs) },
-            fb_len,
-            crtcs: unsafe { mem::transmute(crtcs) },
-            crtc_len,
-            connectors: unsafe { mem::transmute(connectors) },
-            conn_len,
-            encoders: unsafe { mem::transmute(encoders) },
-            enc_len,
-            width: (ffi_res.min_width, ffi_res.max_width),
-            height: (ffi_res.min_height, ffi_res.max_height),
+        let res = unsafe {
+            ResourceHandles {
+                fbs: transmute_vec_from_u32(fbs),
+                crtcs: transmute_vec_from_u32(crtcs),
+                connectors: transmute_vec_from_u32(connectors),
+                encoders: transmute_vec_from_u32(encoders),
+                width: (ffi_res.min_width, ffi_res.max_width),
+                height: (ffi_res.min_height, ffi_res.max_height),
+            }
         };
 
         Ok(res)
     }
 
     /// Gets the set of plane handles that this device currently has
-    fn plane_handles(&self) -> Result<PlaneResourceHandles, SystemError> {
-        let mut planes = [0u32; 32];
-        let mut plane_slice = &mut planes[..];
-
-        let _ffi_res = ffi::mode::get_plane_resources(self.as_raw_fd(), Some(&mut plane_slice))?;
-
-        let plane_len = plane_slice.len();
-
-        let res = PlaneResourceHandles {
-            planes: unsafe { mem::transmute(planes) },
-            plane_len,
-        };
-
-        Ok(res)
+    fn plane_handles(&self) -> Result<Vec<plane::Handle>, SystemError> {
+        let mut planes = Vec::new();
+        let _ = ffi::mode::get_plane_resources(self.as_fd(), Some(&mut planes))?;
+        Ok(unsafe { transmute_vec_from_u32(planes) })
     }
 
     /// Returns information about a specific connector
-    fn get_connector(&self, handle: connector::Handle) -> Result<connector::Info, SystemError> {
+    ///
+    /// ## Force-probing
+    ///
+    /// If `force_probe` is set to `true` and the DRM client is the current DRM master,
+    /// the kernel will perform a forced probe on the connector to refresh the connector status, modes and EDID.
+    /// A forced-probe can be slow, might cause flickering and the ioctl will block.
+    ///
+    /// - User needs to force-probe connectors to ensure their metadata is up-to-date at startup and after receiving a hot-plug event.
+    /// - User may perform a forced-probe when the user explicitly requests it.
+    /// - User shouldn’t perform a forced-probe in other situations.
+    fn get_connector(
+        &self,
+        handle: connector::Handle,
+        force_probe: bool,
+    ) -> Result<connector::Info, SystemError> {
         // Maximum number of encoders is 3 due to kernel restrictions
-        let mut encoders = [0u32; 3];
-        let mut enc_slice = &mut encoders[..];
+        let mut encoders = Vec::new();
         let mut modes = Vec::new();
 
         let ffi_info = ffi::mode::get_connector(
-            self.as_raw_fd(),
+            self.as_fd(),
             handle.into(),
             None,
             None,
             Some(&mut modes),
-            Some(&mut enc_slice),
+            Some(&mut encoders),
+            force_probe,
         )?;
 
         let connector = connector::Info {
@@ -166,9 +173,10 @@ pub trait Device: super::Device {
                 (0, 0) => None,
                 (x, y) => Some((x, y)),
             },
-            modes: unsafe { mem::transmute(modes) },
-            encoders: unsafe { mem::transmute(encoders) },
+            modes: Mode::wrap_vec(modes),
+            encoders: unsafe { transmute_vec_from_u32(encoders) },
             curr_enc: unsafe { mem::transmute(ffi_info.encoder_id) },
+            subpixel: connector::SubPixel::from_raw(ffi_info.subpixel),
         };
 
         Ok(connector)
@@ -176,7 +184,7 @@ pub trait Device: super::Device {
 
     /// Returns information about a specific encoder
     fn get_encoder(&self, handle: encoder::Handle) -> Result<encoder::Info, SystemError> {
-        let info = ffi::mode::get_encoder(self.as_raw_fd(), handle.into())?;
+        let info = ffi::mode::get_encoder(self.as_fd(), handle.into())?;
 
         let enc = encoder::Info {
             handle,
@@ -191,7 +199,7 @@ pub trait Device: super::Device {
 
     /// Returns information about a specific CRTC
     fn get_crtc(&self, handle: crtc::Handle) -> Result<crtc::Info, SystemError> {
-        let info = ffi::mode::get_crtc(self.as_raw_fd(), handle.into())?;
+        let info = ffi::mode::get_crtc(self.as_fd(), handle.into())?;
 
         let crtc = crtc::Info {
             handle,
@@ -217,13 +225,13 @@ pub trait Device: super::Device {
         mode: Option<Mode>,
     ) -> Result<(), SystemError> {
         let _info = ffi::mode::set_crtc(
-            self.as_raw_fd(),
+            self.as_fd(),
             handle.into(),
-            framebuffer.map(|x| x.into()).unwrap_or(0),
+            framebuffer.map(Into::into).unwrap_or(0),
             pos.0,
             pos.1,
             unsafe { &*(conns as *const _ as *const [u32]) },
-            unsafe { mem::transmute(mode) },
+            mode.map(|m| m.into()),
         )?;
 
         Ok(())
@@ -234,7 +242,7 @@ pub trait Device: super::Device {
         &self,
         handle: framebuffer::Handle,
     ) -> Result<framebuffer::Info, SystemError> {
-        let info = ffi::mode::get_framebuffer(self.as_raw_fd(), handle.into())?;
+        let info = ffi::mode::get_framebuffer(self.as_fd(), handle.into())?;
 
         let fb = framebuffer::Info {
             handle,
@@ -242,7 +250,38 @@ pub trait Device: super::Device {
             pitch: info.pitch,
             bpp: info.bpp,
             depth: info.depth,
-            buffer: info.handle,
+            buffer: from_u32(info.handle),
+        };
+
+        Ok(fb)
+    }
+
+    /// Returns information about a specific framebuffer (with modifiers)
+    fn get_planar_framebuffer(
+        &self,
+        handle: framebuffer::Handle,
+    ) -> Result<framebuffer::PlanarInfo, SystemError> {
+        let info = ffi::mode::get_framebuffer2(self.as_fd(), handle.into())?;
+
+        let pixel_format = match DrmFourcc::try_from(info.pixel_format) {
+            Ok(pixel_format) => pixel_format,
+            Err(UnrecognizedFourcc(_)) => return Err(SystemError::UnknownFourcc),
+        };
+
+        let flags = FbCmd2Flags::from_bits_truncate(info.flags);
+        let modifier = flags
+            .contains(FbCmd2Flags::MODIFIERS)
+            .then(|| DrmModifier::from(info.modifier[0]));
+
+        let fb = framebuffer::PlanarInfo {
+            handle,
+            size: (info.width, info.height),
+            pixel_format,
+            flags,
+            buffers: bytemuck::cast(info.handles),
+            pitches: info.pitches,
+            offsets: info.offsets,
+            modifier,
         };
 
         Ok(fb)
@@ -260,7 +299,7 @@ pub trait Device: super::Device {
     {
         let (w, h) = buffer.size();
         let info = ffi::mode::add_fb(
-            self.as_raw_fd(),
+            self.as_fd(),
             w,
             h,
             buffer.pitch(),
@@ -269,36 +308,40 @@ pub trait Device: super::Device {
             buffer.handle().into(),
         )?;
 
-        Ok(unsafe { mem::transmute(info.fb_id) })
+        Ok(from_u32(info.fb_id).unwrap())
     }
 
     /// Add framebuffer (with modifiers)
     fn add_planar_framebuffer<B>(
         &self,
         planar_buffer: &B,
-        modifiers: &[Option<DrmModifier>; 4],
-        flags: u32,
+        flags: FbCmd2Flags,
     ) -> Result<framebuffer::Handle, SystemError>
     where
         B: buffer::PlanarBuffer + ?Sized,
     {
+        let modifier = planar_buffer.modifier();
+        let has_modifier = flags.contains(FbCmd2Flags::MODIFIERS);
+        assert!((has_modifier && modifier.is_some()) || (!has_modifier && modifier.is_none()));
+        let modifier = if let Some(modifier) = modifier {
+            u64::from(modifier)
+        } else {
+            0
+        };
+
         let (w, h) = planar_buffer.size();
         let opt_handles = planar_buffer.handles();
-        let handles = [
-            opt_handles[0].map(|x| x.into()).unwrap_or(0),
-            opt_handles[1].map(|x| x.into()).unwrap_or(0),
-            opt_handles[2].map(|x| x.into()).unwrap_or(0),
-            opt_handles[3].map(|x| x.into()).unwrap_or(0),
-        ];
+
+        let handles = bytemuck::cast(opt_handles);
         let mods = [
-            modifiers[0].map(Into::<u64>::into).unwrap_or(0),
-            modifiers[1].map(Into::<u64>::into).unwrap_or(0),
-            modifiers[2].map(Into::<u64>::into).unwrap_or(0),
-            modifiers[3].map(Into::<u64>::into).unwrap_or(0),
+            opt_handles[0].map_or(0, |_| modifier),
+            opt_handles[1].map_or(0, |_| modifier),
+            opt_handles[2].map_or(0, |_| modifier),
+            opt_handles[3].map_or(0, |_| modifier),
         ];
 
         let info = ffi::mode::add_fb2(
-            self.as_raw_fd(),
+            self.as_fd(),
             w,
             h,
             planar_buffer.format() as u32,
@@ -306,10 +349,10 @@ pub trait Device: super::Device {
             &planar_buffer.pitches(),
             &planar_buffer.offsets(),
             &mods,
-            flags,
+            flags.bits(),
         )?;
 
-        Ok(unsafe { mem::transmute(info.fb_id) })
+        Ok(from_u32(info.fb_id).unwrap())
     }
 
     /// Mark parts of a framebuffer dirty
@@ -318,31 +361,30 @@ pub trait Device: super::Device {
         handle: framebuffer::Handle,
         clips: &[ClipRect],
     ) -> Result<(), SystemError> {
-        ffi::mode::dirty_fb(self.as_raw_fd(), handle.into(), clips)?;
+        ffi::mode::dirty_fb(self.as_fd(), handle.into(), unsafe {
+            // SAFETY: ClipRect is repr(transparent) for drm_clip_rect
+            core::slice::from_raw_parts(clips.as_ptr() as *const ffi::drm_clip_rect, clips.len())
+        })?;
         Ok(())
     }
 
     /// Destroy a framebuffer
     fn destroy_framebuffer(&self, handle: framebuffer::Handle) -> Result<(), SystemError> {
-        ffi::mode::rm_fb(self.as_raw_fd(), handle.into())
+        ffi::mode::rm_fb(self.as_fd(), handle.into())
     }
 
     /// Returns information about a specific plane
     fn get_plane(&self, handle: plane::Handle) -> Result<plane::Info, SystemError> {
-        let mut formats = [0u32; 8];
-        let mut fmt_slice = &mut formats[..];
+        let mut formats = Vec::new();
 
-        let info = ffi::mode::get_plane(self.as_raw_fd(), handle.into(), Some(&mut fmt_slice))?;
-
-        let fmt_len = fmt_slice.len();
+        let info = ffi::mode::get_plane(self.as_fd(), handle.into(), Some(&mut formats))?;
 
         let plane = plane::Info {
             handle,
             crtc: from_u32(info.crtc_id),
             fb: from_u32(info.fb_id),
             pos_crtcs: info.possible_crtcs,
-            formats,
-            fmt_len,
+            formats: unsafe { transmute_vec_from_u32(formats) },
         };
 
         Ok(plane)
@@ -361,7 +403,7 @@ pub trait Device: super::Device {
         src_rect: (u32, u32, u32, u32),
     ) -> Result<(), SystemError> {
         let _info = ffi::mode::set_plane(
-            self.as_raw_fd(),
+            self.as_fd(),
             handle.into(),
             crtc.into(),
             framebuffer.map(Into::into).unwrap_or(0),
@@ -381,21 +423,17 @@ pub trait Device: super::Device {
 
     /// Returns information about a specific property.
     fn get_property(&self, handle: property::Handle) -> Result<property::Info, SystemError> {
-        let mut values = [0u64; 24];
-        let mut enums = [ffi::drm_mode_property_enum::default(); 24];
-
-        let mut val_slice = &mut values[..];
-        let mut enum_slice = &mut enums[..];
+        let mut values = Vec::new();
+        let mut enums = Vec::new();
 
         let info = ffi::mode::get_property(
-            self.as_raw_fd(),
+            self.as_fd(),
             handle.into(),
-            Some(&mut val_slice),
-            Some(&mut enum_slice),
+            Some(&mut values),
+            Some(&mut enums),
         )?;
 
         let flags = ModePropFlags::from_bits_truncate(info.flags);
-        let val_len = val_slice.len();
 
         let val_type = {
             use self::property::ValueType;
@@ -416,8 +454,7 @@ pub trait Device: super::Device {
             } else if flags.contains(ModePropFlags::ENUM) {
                 let enum_values = self::property::EnumValues {
                     values,
-                    enums: unsafe { mem::transmute(enums) },
-                    length: val_len,
+                    enums: property::EnumValue::wrap_vec(enums),
                 };
 
                 ValueType::Enum(enum_values)
@@ -460,13 +497,7 @@ pub trait Device: super::Device {
         prop: property::Handle,
         value: property::RawValue,
     ) -> Result<(), SystemError> {
-        ffi::mode::set_property(
-            self.as_raw_fd(),
-            prop.into(),
-            handle.into(),
-            T::FFI_TYPE,
-            value,
-        )?;
+        ffi::mode::set_property(self.as_fd(), prop.into(), handle.into(), T::FFI_TYPE, value)?;
 
         Ok(())
     }
@@ -476,22 +507,21 @@ pub trait Device: super::Device {
         let data = unsafe {
             std::slice::from_raw_parts_mut(data as *const _ as *mut u8, mem::size_of::<T>())
         };
-        let blob = ffi::mode::create_property_blob(self.as_raw_fd(), data)?;
+        let blob = ffi::mode::create_property_blob(self.as_fd(), data)?;
 
         Ok(property::Value::Blob(blob.blob_id.into()))
     }
 
     /// Get a property blob's data
     fn get_property_blob(&self, blob: u64) -> Result<Vec<u8>, SystemError> {
-        let len = ffi::mode::get_property_blob(self.as_raw_fd(), blob as u32, None)?.length;
-        let mut data = vec![0u8; len as usize];
-        let _ = ffi::mode::get_property_blob(self.as_raw_fd(), blob as u32, Some(&mut &mut *data))?;
+        let mut data = Vec::new();
+        let _ = ffi::mode::get_property_blob(self.as_fd(), blob as u32, Some(&mut data))?;
         Ok(data)
     }
 
     /// Destroy a given property blob value
     fn destroy_property_blob(&self, blob: u64) -> Result<(), SystemError> {
-        ffi::mode::destroy_property_blob(self.as_raw_fd(), blob as u32)?;
+        ffi::mode::destroy_property_blob(self.as_fd(), blob as u32)?;
 
         Ok(())
     }
@@ -501,15 +531,16 @@ pub trait Device: super::Device {
         let mut modes = Vec::new();
 
         let _ffi_info = ffi::mode::get_connector(
-            self.as_raw_fd(),
+            self.as_fd(),
             handle.into(),
             None,
             None,
             Some(&mut modes),
             None,
+            false,
         )?;
 
-        Ok(unsafe { mem::transmute(modes) })
+        Ok(Mode::wrap_vec(modes))
     }
 
     /// Gets a list of property handles and values for this resource.
@@ -517,26 +548,20 @@ pub trait Device: super::Device {
         &self,
         handle: T,
     ) -> Result<PropertyValueSet, SystemError> {
-        let mut prop_ids = [0u32; 32];
-        let mut prop_vals = [0u64; 32];
-
-        let mut prop_id_slice = &mut prop_ids[..];
-        let mut prop_val_slice = &mut prop_vals[..];
+        let mut prop_ids = Vec::new();
+        let mut prop_vals = Vec::new();
 
         ffi::mode::get_properties(
-            self.as_raw_fd(),
+            self.as_fd(),
             handle.into(),
             T::FFI_TYPE,
-            Some(&mut prop_id_slice),
-            Some(&mut prop_val_slice),
+            Some(&mut prop_ids),
+            Some(&mut prop_vals),
         )?;
 
-        let prop_len = prop_id_slice.len();
-
         let prop_val_set = PropertyValueSet {
-            prop_ids: unsafe { mem::transmute(prop_ids) },
-            prop_vals: unsafe { mem::transmute(prop_vals) },
-            len: prop_len,
+            prop_ids: unsafe { transmute_vec_from_u32(prop_ids) },
+            prop_vals,
         };
 
         Ok(prop_val_set)
@@ -559,7 +584,7 @@ pub trait Device: super::Device {
         }
 
         ffi::mode::get_gamma(
-            self.as_raw_fd(),
+            self.as_fd(),
             crtc.into(),
             crtc_info.gamma_length as usize,
             red,
@@ -587,7 +612,7 @@ pub trait Device: super::Device {
         }
 
         ffi::mode::set_gamma(
-            self.as_raw_fd(),
+            self.as_fd(),
             crtc.into(),
             crtc_info.gamma_length as usize,
             red,
@@ -600,13 +625,13 @@ pub trait Device: super::Device {
 
     /// Open a GEM buffer handle by name
     fn open_buffer(&self, name: buffer::Name) -> Result<buffer::Handle, SystemError> {
-        let info = drm_ffi::gem::open(self.as_raw_fd(), name.into())?;
-        Ok(unsafe { mem::transmute(info.handle) })
+        let info = drm_ffi::gem::open(self.as_fd(), name.into())?;
+        Ok(from_u32(info.handle).unwrap())
     }
 
     /// Close a GEM buffer handle
     fn close_buffer(&self, handle: buffer::Handle) -> Result<(), SystemError> {
-        let _info = drm_ffi::gem::close(self.as_raw_fd(), handle.into())?;
+        let _info = drm_ffi::gem::close(self.as_fd(), handle.into())?;
         Ok(())
     }
 
@@ -617,14 +642,14 @@ pub trait Device: super::Device {
         format: buffer::DrmFourcc,
         bpp: u32,
     ) -> Result<DumbBuffer, SystemError> {
-        let info = drm_ffi::mode::dumbbuffer::create(self.as_raw_fd(), size.0, size.1, bpp, 0)?;
+        let info = drm_ffi::mode::dumbbuffer::create(self.as_fd(), size.0, size.1, bpp, 0)?;
 
         let dumb = DumbBuffer {
             size: (info.width, info.height),
             length: info.size as usize,
             format,
             pitch: info.pitch,
-            handle: unsafe { mem::transmute(info.handle) },
+            handle: from_u32(info.handle).unwrap(),
         };
 
         Ok(dumb)
@@ -634,17 +659,16 @@ pub trait Device: super::Device {
         &self,
         buffer: &'a mut DumbBuffer,
     ) -> Result<DumbMapping<'a>, SystemError> {
-        let info = drm_ffi::mode::dumbbuffer::map(self.as_raw_fd(), buffer.handle.into(), 0, 0)?;
+        let info = drm_ffi::mode::dumbbuffer::map(self.as_fd(), buffer.handle.into(), 0, 0)?;
 
         let map = {
             use nix::sys::mman;
-            let addr = core::ptr::null_mut();
             let prot = mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE;
             let flags = mman::MapFlags::MAP_SHARED;
-            let length = buffer.length;
-            let fd = self.as_raw_fd();
+            let length = NonZeroUsize::new(buffer.length).ok_or(SystemError::InvalidArgument)?;
+            let fd = self.as_fd();
             let offset = info.offset as _;
-            unsafe { mman::mmap(addr, length, prot, flags, fd, offset)? }
+            unsafe { mman::mmap(None, length, prot, flags, Some(fd), offset)? }
         };
 
         let mapping = DumbMapping {
@@ -657,7 +681,7 @@ pub trait Device: super::Device {
 
     /// Free the memory resources of a dumb buffer
     fn destroy_dumb_buffer(&self, buffer: DumbBuffer) -> Result<(), SystemError> {
-        let _info = drm_ffi::mode::dumbbuffer::destroy(self.as_raw_fd(), buffer.handle.into())?;
+        let _info = drm_ffi::mode::dumbbuffer::destroy(self.as_fd(), buffer.handle.into())?;
 
         Ok(())
     }
@@ -677,7 +701,7 @@ pub trait Device: super::Device {
                 (buf.handle().into(), w, h)
             })
             .unwrap_or((0, 0, 0));
-        drm_ffi::mode::set_cursor(self.as_raw_fd(), crtc.into(), id, w, h)?;
+        drm_ffi::mode::set_cursor(self.as_fd(), crtc.into(), id, w, h)?;
 
         Ok(())
     }
@@ -703,15 +727,7 @@ pub trait Device: super::Device {
                 (buf.handle().into(), w, h)
             })
             .unwrap_or((0, 0, 0));
-        drm_ffi::mode::set_cursor2(
-            self.as_raw_fd(),
-            crtc.into(),
-            id,
-            w,
-            h,
-            hotspot.0,
-            hotspot.1,
-        )?;
+        drm_ffi::mode::set_cursor2(self.as_fd(), crtc.into(), id, w, h, hotspot.0, hotspot.1)?;
 
         Ok(())
     }
@@ -720,7 +736,7 @@ pub trait Device: super::Device {
     #[deprecated(note = "Usage of deprecated ioctl move_cursor: use a cursor plane instead")]
     #[allow(deprecated)]
     fn move_cursor(&self, crtc: crtc::Handle, pos: (i32, i32)) -> Result<(), SystemError> {
-        drm_ffi::mode::move_cursor(self.as_raw_fd(), crtc.into(), pos.0, pos.1)?;
+        drm_ffi::mode::move_cursor(self.as_fd(), crtc.into(), pos.0, pos.1)?;
 
         Ok(())
     }
@@ -732,25 +748,29 @@ pub trait Device: super::Device {
         mut req: atomic::AtomicModeReq,
     ) -> Result<(), SystemError> {
         drm_ffi::mode::atomic_commit(
-            self.as_raw_fd(),
+            self.as_fd(),
             flags.bits(),
             unsafe { &mut *(&mut *req.objects as *mut _ as *mut [u32]) },
-            &mut *req.count_props_per_object,
+            &mut req.count_props_per_object,
             unsafe { &mut *(&mut *req.props as *mut _ as *mut [u32]) },
-            &mut *req.values,
+            &mut req.values,
         )
     }
 
     /// Convert a prime file descriptor to a GEM buffer handle
-    fn prime_fd_to_buffer(&self, fd: RawFd) -> Result<buffer::Handle, SystemError> {
-        let info = ffi::gem::fd_to_handle(self.as_raw_fd(), fd)?;
-        Ok(unsafe { mem::transmute(info.handle) })
+    fn prime_fd_to_buffer(&self, fd: BorrowedFd<'_>) -> Result<buffer::Handle, SystemError> {
+        let info = ffi::gem::fd_to_handle(self.as_fd(), fd)?;
+        Ok(from_u32(info.handle).unwrap())
     }
 
-    /// Convert a prime file descriptor to a GEM buffer handle
-    fn buffer_to_prime_fd(&self, handle: buffer::Handle, flags: u32) -> Result<RawFd, SystemError> {
-        let info = ffi::gem::handle_to_fd(self.as_raw_fd(), handle.into(), flags)?;
-        Ok(info.fd)
+    /// Convert a GEM buffer handle to a prime file descriptor
+    fn buffer_to_prime_fd(
+        &self,
+        handle: buffer::Handle,
+        flags: u32,
+    ) -> Result<OwnedFd, SystemError> {
+        let info = ffi::gem::handle_to_fd(self.as_fd(), handle.into(), flags)?;
+        Ok(unsafe { OwnedFd::from_raw_fd(info.fd) })
     }
 
     /// Queue a page flip on the given crtc
@@ -759,22 +779,188 @@ pub trait Device: super::Device {
         handle: crtc::Handle,
         framebuffer: framebuffer::Handle,
         flags: PageFlipFlags,
-        target_sequence: Option<(PageFlipTarget, u32)>,
+        target_sequence: Option<PageFlipTarget>,
     ) -> Result<(), SystemError> {
         let mut flags = flags.bits();
-        if let Some((target, _)) = target_sequence {
-            flags |= target as u32;
-        }
 
-        let _info = ffi::mode::page_flip(
-            self.as_raw_fd(),
+        let sequence = match target_sequence {
+            Some(PageFlipTarget::Absolute(n)) => {
+                flags |= ffi::drm_sys::DRM_MODE_PAGE_FLIP_TARGET_ABSOLUTE;
+                n
+            }
+            Some(PageFlipTarget::Relative(n)) => {
+                flags |= ffi::drm_sys::DRM_MODE_PAGE_FLIP_TARGET_RELATIVE;
+                n
+            }
+            None => 0,
+        };
+
+        ffi::mode::page_flip(
+            self.as_fd(),
             handle.into(),
             framebuffer.into(),
             flags,
-            target_sequence.map(|(_, sequence)| sequence).unwrap_or(0),
+            sequence,
         )?;
 
         Ok(())
+    }
+
+    /// Creates a syncobj.
+    fn create_syncobj(&self, signalled: bool) -> Result<syncobj::Handle, SystemError> {
+        let info = ffi::syncobj::create(self.as_fd(), signalled)?;
+        Ok(from_u32(info.handle).unwrap())
+    }
+
+    /// Destroys a syncobj.
+    fn destroy_syncobj(&self, handle: syncobj::Handle) -> Result<(), SystemError> {
+        ffi::syncobj::destroy(self.as_fd(), handle.into())?;
+        Ok(())
+    }
+
+    /// Exports a syncobj as an inter-process file descriptor or as a poll()-able sync file.
+    fn syncobj_to_fd(
+        &self,
+        handle: syncobj::Handle,
+        export_sync_file: bool,
+    ) -> Result<OwnedFd, SystemError> {
+        let info = ffi::syncobj::handle_to_fd(self.as_fd(), handle.into(), export_sync_file)?;
+        Ok(unsafe { OwnedFd::from_raw_fd(info.fd) })
+    }
+
+    /// Imports a file descriptor exported by [`Self::syncobj_to_fd`] back into a process-local handle.
+    fn fd_to_syncobj(
+        &self,
+        fd: BorrowedFd<'_>,
+        import_sync_file: bool,
+    ) -> Result<syncobj::Handle, SystemError> {
+        let info = ffi::syncobj::fd_to_handle(self.as_fd(), fd, import_sync_file)?;
+        Ok(from_u32(info.handle).unwrap())
+    }
+
+    /// Waits for one or more syncobjs to become signalled.
+    fn syncobj_wait(
+        &self,
+        handles: &[syncobj::Handle],
+        timeout_nsec: i64,
+        wait_all: bool,
+        wait_for_submit: bool,
+    ) -> Result<u32, SystemError> {
+        let info = ffi::syncobj::wait(
+            self.as_fd(),
+            bytemuck::cast_slice(handles),
+            timeout_nsec,
+            wait_all,
+            wait_for_submit,
+        )?;
+        Ok(info.first_signaled)
+    }
+
+    /// Resets (un-signals) one or more syncobjs.
+    fn syncobj_reset(&self, handles: &[syncobj::Handle]) -> Result<(), SystemError> {
+        ffi::syncobj::reset(self.as_fd(), bytemuck::cast_slice(handles))?;
+        Ok(())
+    }
+
+    /// Signals one or more syncobjs.
+    fn syncobj_signal(&self, handles: &[syncobj::Handle]) -> Result<(), SystemError> {
+        ffi::syncobj::signal(self.as_fd(), bytemuck::cast_slice(handles))?;
+        Ok(())
+    }
+
+    /// Waits for one or more specific timeline syncobj points.
+    fn syncobj_timeline_wait(
+        &self,
+        handles: &[syncobj::Handle],
+        points: &[u64],
+        timeout_nsec: i64,
+        wait_all: bool,
+        wait_for_submit: bool,
+        wait_available: bool,
+    ) -> Result<u32, SystemError> {
+        let info = ffi::syncobj::timeline_wait(
+            self.as_fd(),
+            bytemuck::cast_slice(handles),
+            points,
+            timeout_nsec,
+            wait_all,
+            wait_for_submit,
+            wait_available,
+        )?;
+        Ok(info.first_signaled)
+    }
+
+    /// Queries for state of one or more timeline syncobjs.
+    fn syncobj_timeline_query(
+        &self,
+        handles: &[syncobj::Handle],
+        points: &mut [u64],
+        last_submitted: bool,
+    ) -> Result<(), SystemError> {
+        ffi::syncobj::query(
+            self.as_fd(),
+            bytemuck::cast_slice(handles),
+            points,
+            last_submitted,
+        )?;
+        Ok(())
+    }
+
+    /// Transfers one timeline syncobj point to another.
+    fn syncobj_timeline_transfer(
+        &self,
+        src_handle: syncobj::Handle,
+        dst_handle: syncobj::Handle,
+        src_point: u64,
+        dst_point: u64,
+    ) -> Result<(), SystemError> {
+        ffi::syncobj::transfer(
+            self.as_fd(),
+            src_handle.into(),
+            dst_handle.into(),
+            src_point,
+            dst_point,
+        )?;
+        Ok(())
+    }
+
+    /// Signals one or more specific timeline syncobj points.
+    fn syncobj_timeline_signal(
+        &self,
+        handles: &[syncobj::Handle],
+        points: &[u64],
+    ) -> Result<(), SystemError> {
+        ffi::syncobj::timeline_signal(self.as_fd(), bytemuck::cast_slice(handles), points)?;
+        Ok(())
+    }
+
+    /// Create a drm lease
+    fn create_lease(
+        &self,
+        objects: &[RawResourceHandle],
+        flags: OFlag,
+    ) -> Result<(LeaseId, OwnedFd), SystemError> {
+        let lease = ffi::mode::create_lease(
+            self.as_fd(),
+            bytemuck::cast_slice(objects),
+            flags.bits() as u32,
+        )?;
+        Ok((
+            unsafe { NonZeroU32::new_unchecked(lease.lessee_id) },
+            unsafe { OwnedFd::from_raw_fd(lease.fd as RawFd) },
+        ))
+    }
+
+    /// List active lessees
+    fn list_lessees(&self) -> Result<Vec<LeaseId>, SystemError> {
+        let mut lessees = Vec::new();
+        ffi::mode::list_lessees(self.as_fd(), Some(&mut lessees))?;
+        Ok(unsafe { transmute_vec_from_u32(lessees) })
+    }
+
+    /// Revoke a previously issued drm lease
+    fn revoke_lease(&self, lessee_id: LeaseId) -> Result<(), SystemError> {
+        ffi::mode::revoke_lease(self.as_fd(), lessee_id.get())
     }
 
     /// Receive pending events
@@ -783,12 +969,60 @@ pub trait Device: super::Device {
         Self: Sized,
     {
         let mut event_buf: [u8; 1024] = [0; 1024];
-        let amount = ::nix::unistd::read(self.as_raw_fd(), &mut event_buf)?;
+        let amount = ::nix::unistd::read(self.as_fd().as_raw_fd(), &mut event_buf)?;
 
-        Ok(Events {
-            event_buf,
-            amount,
-            i: 0,
+        Ok(Events::with_event_buf(event_buf, amount))
+    }
+}
+
+/// List of leased resources
+pub struct LeaseResources {
+    /// leased crtcs
+    pub crtcs: Vec<crtc::Handle>,
+    /// leased connectors
+    pub connectors: Vec<connector::Handle>,
+    /// leased planes
+    pub planes: Vec<plane::Handle>,
+}
+
+/// Query lease resources
+pub fn get_lease<D: AsFd>(lease: D) -> Result<LeaseResources, SystemError> {
+    let mut crtcs = Vec::new();
+    let mut connectors = Vec::new();
+    let mut planes = Vec::new();
+    let mut objects = Vec::new();
+
+    ffi::mode::get_lease(lease.as_fd(), Some(&mut objects))?;
+
+    let _ = ffi::mode::get_resources(
+        lease.as_fd(),
+        None,
+        Some(&mut crtcs),
+        Some(&mut connectors),
+        None,
+    )?;
+    let _ = ffi::mode::get_plane_resources(lease.as_fd(), Some(&mut planes))?;
+
+    unsafe {
+        Ok(LeaseResources {
+            crtcs: transmute_vec_from_u32::<crtc::Handle>(
+                crtcs
+                    .into_iter()
+                    .filter(|handle| objects.contains(handle))
+                    .collect(),
+            ),
+            connectors: transmute_vec_from_u32::<connector::Handle>(
+                connectors
+                    .into_iter()
+                    .filter(|handle| objects.contains(handle))
+                    .collect(),
+            ),
+            planes: transmute_vec_from_u32::<plane::Handle>(
+                planes
+                    .into_iter()
+                    .filter(|handle| objects.contains(handle))
+                    .collect(),
+            ),
         })
     }
 }
@@ -799,6 +1033,7 @@ bitflags::bitflags! {
     /// Limited to the values in [`ffi::drm_sys::DRM_MODE_PAGE_FLIP_FLAGS`],
     /// minus [`ffi::drm_sys::DRM_MODE_PAGE_FLIP_TARGET`] bits which are
     /// passed through [`PageFlipTarget`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct PageFlipFlags : u32 {
         /// Request a vblank event on page flip
         const EVENT = ffi::drm_sys::DRM_MODE_PAGE_FLIP_EVENT;
@@ -807,18 +1042,17 @@ bitflags::bitflags! {
     }
 }
 
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Target to alter the sequence of page flips
 ///
-/// These are the [`ffi::drm_sys::DRM_MODE_PAGE_FLIP_FLAGS`] bits
+/// These represent the [`ffi::drm_sys::DRM_MODE_PAGE_FLIP_TARGET`] bits
 /// of [`PageFlipFlags`] wrapped in a regular `enum` due to their
 /// mutual-exclusiveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PageFlipTarget {
     /// Absolute Vblank Sequence
-    Absolute = ffi::drm_sys::DRM_MODE_PAGE_FLIP_TARGET_ABSOLUTE,
+    Absolute(u32),
     /// Relative Vblank Sequence (to the current, when calling)
-    Relative = ffi::drm_sys::DRM_MODE_PAGE_FLIP_TARGET_RELATIVE,
+    Relative(u32),
 }
 
 /// Iterator over [`Event`]s of a device. Create via [`Device::receive_events()`].
@@ -826,6 +1060,18 @@ pub struct Events {
     event_buf: [u8; 1024],
     amount: usize,
     i: usize,
+}
+
+impl Events {
+    /// Create [`Event`]s iterator from buffer read using something other than
+    /// [`Device::receive_events()`].
+    pub fn with_event_buf(event_buf: [u8; 1024], amount: usize) -> Self {
+        Events {
+            event_buf,
+            amount,
+            i: 0,
+        }
+    }
 }
 
 /// An event from a device.
@@ -842,10 +1088,12 @@ pub enum Event {
 pub struct VblankEvent {
     /// sequence of the frame
     pub frame: u32,
-    /// duration between events
-    pub duration: Duration,
+    /// time at which the vblank occurred
+    pub time: Duration,
     /// crtc that did throw the event
     pub crtc: crtc::Handle,
+    /// user data that was passed to wait_vblank
+    pub user_data: usize,
 }
 
 /// Page Flip event
@@ -871,11 +1119,13 @@ impl Iterator for Events {
                         unsafe { &*(event as *const _ as *const ffi::drm_event_vblank) };
                     Some(Event::Vblank(VblankEvent {
                         frame: vblank_event.sequence,
-                        duration: Duration::new(
+                        time: Duration::new(
                             vblank_event.tv_sec as u64,
                             vblank_event.tv_usec * 1000,
                         ),
-                        crtc: unsafe { mem::transmute(vblank_event.user_data as u32) },
+                        #[allow(clippy::unnecessary_cast)]
+                        crtc: from_u32(vblank_event.crtc_id as u32).unwrap(),
+                        user_data: vblank_event.user_data as usize,
                     }))
                 }
                 ffi::DRM_EVENT_FLIP_COMPLETE => {
@@ -887,13 +1137,12 @@ impl Iterator for Events {
                             vblank_event.tv_sec as u64,
                             vblank_event.tv_usec * 1000,
                         ),
-                        crtc: unsafe {
-                            mem::transmute(if vblank_event.crtc_id != 0 {
-                                vblank_event.crtc_id
-                            } else {
-                                vblank_event.user_data as u32
-                            })
-                        },
+                        crtc: from_u32(if vblank_event.crtc_id != 0 {
+                            vblank_event.crtc_id
+                        } else {
+                            vblank_event.user_data as u32
+                        })
+                        .unwrap(),
                     }))
                 }
                 _ => Some(Event::Unknown(
@@ -908,16 +1157,16 @@ impl Iterator for Events {
 
 /// The set of [`ResourceHandles`] that a
 /// [`Device`] exposes. Excluding Plane resources.
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ResourceHandles {
-    fbs: [Option<framebuffer::Handle>; 32],
-    fb_len: usize,
-    crtcs: [Option<crtc::Handle>; 32],
-    crtc_len: usize,
-    connectors: [Option<connector::Handle>; 32],
-    conn_len: usize,
-    encoders: [Option<encoder::Handle>; 32],
-    enc_len: usize,
+    /// Set of [`framebuffer::Handle`]
+    pub fbs: Vec<framebuffer::Handle>,
+    /// Set of [`crtc::Handle`]
+    pub crtcs: Vec<crtc::Handle>,
+    /// Set of [`connector::Handle`]
+    pub connectors: Vec<connector::Handle>,
+    /// Set of [`encoder::Handle`]
+    pub encoders: Vec<encoder::Handle>,
     width: (u32, u32),
     height: (u32, u32),
 }
@@ -925,26 +1174,32 @@ pub struct ResourceHandles {
 impl ResourceHandles {
     /// Returns the set of [`connector::Handle`]
     pub fn connectors(&self) -> &[connector::Handle] {
-        let buf_len = std::cmp::min(self.connectors.len(), self.conn_len);
-        unsafe { &*(&self.connectors[..buf_len] as *const _ as *const [connector::Handle]) }
+        &self.connectors
     }
 
     /// Returns the set of [`encoder::Handle`]
     pub fn encoders(&self) -> &[encoder::Handle] {
-        let buf_len = std::cmp::min(self.encoders.len(), self.enc_len);
-        unsafe { &*(&self.encoders[..buf_len] as *const _ as *const [encoder::Handle]) }
+        &self.encoders
     }
 
     /// Returns the set of [`crtc::Handle`]
     pub fn crtcs(&self) -> &[crtc::Handle] {
-        let buf_len = std::cmp::min(self.crtcs.len(), self.crtc_len);
-        unsafe { &*(&self.crtcs[..buf_len] as *const _ as *const [crtc::Handle]) }
+        &self.crtcs
     }
 
     /// Returns the set of [`framebuffer::Handle`]
     pub fn framebuffers(&self) -> &[framebuffer::Handle] {
-        let buf_len = std::cmp::min(self.fbs.len(), self.fb_len);
-        unsafe { &*(&self.fbs[..buf_len] as *const _ as *const [framebuffer::Handle]) }
+        &self.fbs
+    }
+
+    /// Returns the supported minimum and maximum width for framebuffers
+    pub fn supported_fb_width(&self) -> impl RangeBounds<u32> {
+        self.width.0..=self.width.1
+    }
+
+    /// Returns the supported minimum and maximum height for framebuffers
+    pub fn supported_fb_height(&self) -> impl RangeBounds<u32> {
+        self.height.0..=self.height.1
     }
 
     /// Apply a filter the all crtcs of these resources, resulting in a list of crtcs allowed.
@@ -953,45 +1208,8 @@ impl ResourceHandles {
             .iter()
             .enumerate()
             .filter(|&(n, _)| (1 << n) & filter.0 != 0)
-            .flat_map(|(_, &e)| e)
+            .map(|(_, &e)| e)
             .collect()
-    }
-}
-
-impl std::fmt::Debug for ResourceHandles {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("ResourceHandles")
-            .field("fbs", &self.framebuffers())
-            .field("crtcs", &self.crtcs())
-            .field("connectors", &self.connectors())
-            .field("encoders", &self.encoders())
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .finish()
-    }
-}
-
-/// The set of [`plane::Handle`] that a
-/// [`Device`] exposes.
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
-pub struct PlaneResourceHandles {
-    planes: [Option<plane::Handle>; 32],
-    plane_len: usize,
-}
-
-impl PlaneResourceHandles {
-    /// Returns the set of [`plane::Handle`]
-    pub fn planes(&self) -> &[plane::Handle] {
-        let buf_len = std::cmp::min(self.planes.len(), self.plane_len);
-        unsafe { &*(&self.planes[..buf_len] as *const _ as *const [plane::Handle]) }
-    }
-}
-
-impl std::fmt::Debug for PlaneResourceHandles {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("PlaneResourceHandles")
-            .field("planes", &self.planes())
-            .finish()
     }
 }
 
@@ -1002,7 +1220,7 @@ pub struct CrtcListFilter(u32);
 
 /// Resolution and timing information for a display mode.
 #[repr(transparent)]
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, bytemuck::TransparentWrapper)]
 pub struct Mode {
     // We're using the FFI struct because the DRM API expects it when giving it
     // to a CRTC or creating a blob from it. Rather than rearranging the fields
@@ -1092,6 +1310,7 @@ impl std::fmt::Debug for Mode {
 
 bitflags::bitflags! {
     /// Display mode type flags
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct ModeTypeFlags : u32 {
         /// Builtin mode type
         #[deprecated]
@@ -1118,6 +1337,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     /// Display mode flags
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct ModeFlags: u32 {
         /// PHSYNC flag
         const PHSYNC = ffi::DRM_MODE_FLAG_PHSYNC;
@@ -1181,31 +1401,95 @@ pub enum PlaneType {
 }
 
 /// Wrapper around a set of property IDs and their raw values.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct PropertyValueSet {
-    prop_ids: [Option<property::Handle>; 32],
-    prop_vals: [property::RawValue; 32],
-    len: usize,
+    prop_ids: Vec<property::Handle>,
+    prop_vals: Vec<property::RawValue>,
 }
 
 impl PropertyValueSet {
+    /// Returns a HashMap mapping property names to info
+    pub fn as_hashmap(
+        &self,
+        device: &impl Device,
+    ) -> Result<HashMap<String, property::Info>, SystemError> {
+        let mut map = HashMap::new();
+        for id in self.prop_ids.iter() {
+            let info = device.get_property(*id)?;
+            let name = info.name().to_str().unwrap().to_owned();
+            map.insert(name, info);
+        }
+        Ok(map)
+    }
+
     /// Returns a pair representing a set of [`property::Handle`] and their raw values
     pub fn as_props_and_values(&self) -> (&[property::Handle], &[property::RawValue]) {
-        unsafe {
-            (
-                &*(&self.prop_ids[..self.len] as *const _ as *const [property::Handle]),
-                &*(&self.prop_vals[..self.len] as *const _ as *const [property::RawValue]),
-            )
-        }
+        (&self.prop_ids, &self.prop_vals)
+    }
+
+    /// Returns iterator over pairs representing a set of [`property::Handle`] and their raw values
+    pub fn iter(&self) -> impl Iterator<Item = (&property::Handle, &property::RawValue)> {
+        self.into_iter()
     }
 }
 
-type ClipRect = ffi::drm_sys::drm_clip_rect;
+impl<'a> IntoIterator for &'a PropertyValueSet {
+    type Item = (&'a property::Handle, &'a property::RawValue);
+    type IntoIter =
+        Zip<std::slice::Iter<'a, property::Handle>, std::slice::Iter<'a, property::RawValue>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.prop_ids.iter().zip(self.prop_vals.iter())
+    }
+}
+
+impl IntoIterator for PropertyValueSet {
+    type Item = (property::Handle, property::RawValue);
+    type IntoIter =
+        Zip<std::vec::IntoIter<property::Handle>, std::vec::IntoIter<property::RawValue>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.prop_ids.into_iter().zip(self.prop_vals)
+    }
+}
+
+/// Describes a rectangular region of a buffer
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ClipRect(ffi::drm_sys::drm_clip_rect);
+
+impl ClipRect {
+    /// Create a new clipping rectangle.
+    pub fn new(x1: u16, y1: u16, x2: u16, y2: u16) -> Self {
+        Self(ffi::drm_sys::drm_clip_rect { x1, y1, x2, y2 })
+    }
+
+    /// Get the X coordinate of the top left corner of the rectangle.
+    pub fn x1(self) -> u16 {
+        self.0.x1
+    }
+
+    /// Get the Y coordinate of the top left corner of the rectangle.
+    pub fn y1(self) -> u16 {
+        self.0.y1
+    }
+
+    /// Get the X coordinate of the bottom right corner of the rectangle
+    pub fn x2(self) -> u16 {
+        self.0.x2
+    }
+
+    /// Get the Y coordinate of the bottom right corner of the rectangle.
+    pub fn y2(self) -> u16 {
+        self.0.y2
+    }
+}
 
 bitflags::bitflags! {
     /// Commit flags for atomic mode setting
     ///
     /// Limited to the values in [`ffi::drm_sys::DRM_MODE_ATOMIC_FLAGS`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct AtomicCommitFlags : u32 {
         /// Generate a page flip event, when the changes are applied
         const PAGE_FLIP_EVENT = ffi::drm_sys::DRM_MODE_PAGE_FLIP_EVENT;
@@ -1224,6 +1508,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     /// Mode property flags
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct ModePropFlags : u32 {
         /// Do not use
         #[deprecated]
@@ -1256,5 +1541,16 @@ bitflags::bitflags! {
         /// older userspace (DDX drivers) that read/write each prop they find,
         /// witout being aware that this could be triggering a lengthy modeset.
         const ATOMIC = ffi::DRM_MODE_PROP_ATOMIC;
+    }
+}
+
+bitflags::bitflags! {
+    /// Planar framebuffer flags
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct FbCmd2Flags : u32 {
+        /// For interlaced framebuffers
+        const INTERLACED = ffi::DRM_MODE_FB_INTERLACED;
+        /// Enables .modifier
+        const MODIFIERS = ffi::DRM_MODE_FB_MODIFIERS;
     }
 }

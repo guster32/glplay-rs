@@ -23,6 +23,10 @@ use drm_ffi as ffi;
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct Handle(control::RawResourceHandle);
 
+// Safety: Handle is repr(transparent) over NonZeroU32
+unsafe impl bytemuck::ZeroableInOption for Handle {}
+unsafe impl bytemuck::PodInOption for Handle {}
+
 impl From<Handle> for control::RawResourceHandle {
     fn from(handle: Handle) -> Self {
         handle.0
@@ -52,14 +56,13 @@ impl std::fmt::Debug for Handle {
 }
 
 /// Information about a plane
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Info {
     pub(crate) handle: Handle,
     pub(crate) crtc: Option<control::crtc::Handle>,
     pub(crate) fb: Option<control::framebuffer::Handle>,
     pub(crate) pos_crtcs: u32,
-    pub(crate) formats: [u32; 8],
-    pub(crate) fmt_len: usize,
+    pub(crate) formats: Vec<u32>,
 }
 
 impl Info {
@@ -88,7 +91,6 @@ impl Info {
 
     /// Returns the formats this plane supports.
     pub fn formats(&self) -> &[u32] {
-        let buf_len = std::cmp::min(self.formats.len(), self.fmt_len);
-        &self.formats[..buf_len]
+        &self.formats
     }
 }

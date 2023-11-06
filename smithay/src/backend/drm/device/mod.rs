@@ -1,93 +1,170 @@
-
-use::std::os::unix::io::{AsRawFd, RawFd};
-use::std::path::PathBuf;
-use::std::sync::{atomic::AtomicBool, Arc};
-use::std::time::{Instant, SystemTime};
+use std::collections::HashMap;
+use std::io;
+use std::os::unix::io::{AsFd, BorrowedFd};
+use std::sync::atomic::Ordering;
+use std::sync::{atomic::AtomicBool, Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime};
 
 use calloop::{EventSource, Interest, Poll, PostAction, Readiness, Token, TokenFactory};
-use drm::control::{connector, crtc, Device as ControlDevice, Event, Mode, ResourceHandles};
+use drm::control::{connector, crtc, plane, Device as ControlDevice, Event, Mode, ResourceHandles};
 use drm::{ClientCapability, Device as BasicDevice, DriverCapability};
-use nix::libc::dev_t;
-use nix::sys::stat::fstat;
+use libc::dev_t;
 
 pub(super) mod atomic;
+mod fd;
+pub use self::fd::DrmDeviceFd;
 pub(super) mod legacy;
+use crate::utils::{Buffer, DevPath, Size};
+
 use super::surface::{atomic::AtomicDrmSurface, legacy::LegacyDrmSurface, DrmSurface, DrmSurfaceInternal};
 use super::{error::Error, planes, Planes};
-use self::atomic::AtomicDrmDevice;
-use self::legacy::LegacyDrmDevice;
+use atomic::AtomicDrmDevice;
+use legacy::LegacyDrmDevice;
 
-use slog::{error, info, o, trace, warn};
+use tracing::{debug_span, error, info, instrument, trace};
+
+#[derive(Debug)]
+struct PlaneClaimInner {
+    plane: drm::control::plane::Handle,
+    crtc: drm::control::crtc::Handle,
+    storage: PlaneClaimStorage,
+}
+
+impl Drop for PlaneClaimInner {
+    fn drop(&mut self) {
+        self.storage.remove(self.plane);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlaneClaimWeak(Weak<PlaneClaimInner>);
+
+impl PlaneClaimWeak {
+    fn upgrade(&self) -> Option<PlaneClaim> {
+        self.0.upgrade().map(|claim| PlaneClaim { claim })
+    }
+}
+
+/// A claim of a plane
+#[derive(Debug, Clone)]
+pub struct PlaneClaim {
+    claim: Arc<PlaneClaimInner>,
+}
+
+impl PlaneClaim {
+    /// The plane the claim was taken for
+    pub fn plane(&self) -> drm::control::plane::Handle {
+        self.claim.plane
+    }
+
+    /// The crtc the claim was taken for
+    pub fn crtc(&self) -> drm::control::crtc::Handle {
+        self.claim.crtc
+    }
+}
+
+impl PlaneClaim {
+    fn downgrade(&self) -> PlaneClaimWeak {
+        PlaneClaimWeak(Arc::downgrade(&self.claim))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlaneClaimStorage {
+    claimed_planes: Arc<Mutex<HashMap<drm::control::plane::Handle, PlaneClaimWeak>>>,
+}
+
+impl PlaneClaimStorage {
+    pub fn claim(
+        &self,
+        plane: drm::control::plane::Handle,
+        crtc: drm::control::crtc::Handle,
+    ) -> Option<PlaneClaim> {
+        let mut guard = self.claimed_planes.lock().unwrap();
+        if let Some(claim) = guard.get(&plane).and_then(|claim| claim.upgrade()) {
+            if claim.crtc() == crtc {
+                Some(claim)
+            } else {
+                None
+            }
+        } else {
+            let claim = PlaneClaim {
+                claim: Arc::new(PlaneClaimInner {
+                    plane,
+                    crtc,
+                    storage: self.clone(),
+                }),
+            };
+            guard.insert(plane, claim.downgrade());
+            Some(claim)
+        }
+    }
+
+    fn remove(&self, plane: drm::control::plane::Handle) {
+        let mut guard = self.claimed_planes.lock().unwrap();
+        guard.remove(&plane);
+    }
+}
 
 /// An open drm device
 #[derive(Debug)]
-pub struct DrmDevice<A: AsRawFd + 'static> {
+pub struct DrmDevice {
     pub(super) dev_id: dev_t,
-    pub(crate) internal: Arc<DrmDeviceInternal<A>>,
-    #[cfg(feature = "backend_session")]
-    pub(super) links: RefCell<Vec<crate::utils::signaling::SignalToken>>,
+    pub(crate) internal: Arc<DrmDeviceInternal>,
     has_universal_planes: bool,
-    has_monotonic_timestamps: bool,
+    cursor_size: Size<u32, Buffer>,
     resources: ResourceHandles,
-    pub(super) logger: ::slog::Logger,
-    token: Token,
+    plane_claim_storage: PlaneClaimStorage,
 }
 
-impl<A: AsRawFd + 'static> AsRawFd for DrmDevice<A> {
-    fn as_raw_fd(&self) -> RawFd {
+impl AsFd for DrmDevice {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         match &*self.internal {
-            DrmDeviceInternal::Atomic(dev) => dev.fd.as_raw_fd(),
-            DrmDeviceInternal::Legacy(dev) => dev.fd.as_raw_fd(),
+            DrmDeviceInternal::Atomic(dev) => dev.fd.as_fd(),
+            DrmDeviceInternal::Legacy(dev) => dev.fd.as_fd(),
         }
     }
 }
-impl<A: AsRawFd + 'static> BasicDevice for DrmDevice<A> {}
-impl<A: AsRawFd + 'static> ControlDevice for DrmDevice<A> {}
 
-#[derive(Debug)]
-pub struct FdWrapper<A: AsRawFd + 'static> {
-    fd: A,
-    pub(super) privileged: bool,
-    logger: ::slog::Logger,
-}
-
-impl<A: AsRawFd + 'static> AsRawFd for FdWrapper<A> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-impl<A: AsRawFd + 'static> BasicDevice for FdWrapper<A> {}
-impl<A: AsRawFd + 'static> ControlDevice for FdWrapper<A> {}
-
-impl<A: AsRawFd + 'static> Drop for FdWrapper<A> {
-    fn drop(&mut self) {
-        info!(self.logger, "Dropping device: {:?}", self.dev_path());
-        if self.privileged {
-            if let Err(err) = self.release_master_lock() {
-                error!(self.logger, "Failed to drop drm master state. Error: {}", err);
-            }
-        }
-    }
-}
+impl BasicDevice for DrmDevice {}
+impl ControlDevice for DrmDevice {}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum DrmDeviceInternal<A: AsRawFd + 'static> {
-    Atomic(AtomicDrmDevice<A>),
-    Legacy(LegacyDrmDevice<A>),
+pub enum DrmDeviceInternal {
+    Atomic(AtomicDrmDevice),
+    Legacy(LegacyDrmDevice),
 }
-impl<A: AsRawFd + 'static> AsRawFd for DrmDeviceInternal<A> {
-    fn as_raw_fd(&self) -> RawFd {
+
+impl DrmDeviceInternal {
+    pub(crate) fn device_fd(&self) -> &DrmDeviceFd {
         match self {
-            DrmDeviceInternal::Atomic(dev) => dev.fd.as_raw_fd(),
-            DrmDeviceInternal::Legacy(dev) => dev.fd.as_raw_fd(),
+            DrmDeviceInternal::Atomic(dev) => &dev.fd,
+            DrmDeviceInternal::Legacy(dev) => &dev.fd,
+        }
+    }
+
+    fn span(&self) -> &tracing::Span {
+        match self {
+            DrmDeviceInternal::Atomic(internal) => &internal.span,
+            DrmDeviceInternal::Legacy(internal) => &internal.span,
         }
     }
 }
-impl<A: AsRawFd + 'static> BasicDevice for DrmDeviceInternal<A> {}
-impl<A: AsRawFd + 'static> ControlDevice for DrmDeviceInternal<A> {}
 
-impl<A: AsRawFd + 'static> DrmDevice<A> {
+impl AsFd for DrmDeviceInternal {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            DrmDeviceInternal::Atomic(dev) => dev.fd.as_fd(),
+            DrmDeviceInternal::Legacy(dev) => dev.fd.as_fd(),
+        }
+    }
+}
+
+impl BasicDevice for DrmDeviceInternal {}
+impl ControlDevice for DrmDeviceInternal {}
+
+impl DrmDevice {
     /// Create a new [`DrmDevice`] from an open drm node
     ///
     /// # Arguments
@@ -99,79 +176,67 @@ impl<A: AsRawFd + 'static> DrmDevice<A> {
     ///     requires usage of `drm-rs` to disable unused connectors to prevent them \
     ///     showing garbage, but will also prevent flickering of already turned on \
     ///     connectors (assuming you won't change the resolution).
-    /// - `logger` - Optional [`slog::Logger`] to be used by this device.
     ///
     /// # Return
     ///
     /// Returns an error if the file is no valid drm node or the device is not accessible.
+    pub fn new(fd: DrmDeviceFd, disable_connectors: bool) -> Result<(Self, DrmDeviceNotifier), Error> {
+        // setup parent span for internal device types
+        let span = debug_span!(
+            "drm_device",
+            device = ?fd.dev_path()
+        );
+        let _guard = span.enter();
 
-    pub fn new<L>(fd: A, disable_connectors: bool, logger: L) -> Result<Self, Error>
-    where
-        A: AsRawFd + 'static,
-        L: Into<Option<::slog::Logger>>,
-    {
-        let log = crate::slog_or_fallback(logger).new(o!("smithay_module" => "backend_drm"));
-        info!(log, "DrmDevice initializing");
+        info!("DrmDevice initializing");
 
-        let dev_id = fstat(fd.as_raw_fd()).map_err(Error::UnableToGetDeviceId)?.st_rdev;
+        let dev_id = fd.dev_id().map_err(Error::UnableToGetDeviceId)?;
         let active = Arc::new(AtomicBool::new(true));
-        let dev = Arc::new({
-            let mut dev = FdWrapper {
-                fd,
-                privileged: false,
-                logger: log.clone(),
-            };
 
-            // We want to modeset, so we better be the master, if we run via a tty session.
-            // This is only needed on older kernels. Newer kernels grant this permission,
-            // if no other process is already the *master*. So we skip over this error.
-            if dev.acquire_master_lock().is_err() {
-                warn!(log, "Unable to become drm master, assuming unprivileged mode");
-            } else {
-                dev.privileged = true;
-            }
-
-            dev
-        });
-
-        let has_universal_planes = dev
+        let has_universal_planes = fd
             .set_client_capability(ClientCapability::UniversalPlanes, true)
             .is_ok();
-        let has_monotonic_timestamps = dev
+        let has_monotonic_timestamps = fd
             .get_driver_capability(DriverCapability::MonotonicTimestamp)
             .unwrap_or(0)
             == 1;
-        let resources = dev.resource_handles().map_err(|source| Error::Access {
+        let cursor_width = fd
+            .get_driver_capability(DriverCapability::CursorWidth)
+            .unwrap_or(64);
+        let cursor_height = fd
+            .get_driver_capability(DriverCapability::CursorHeight)
+            .unwrap_or(64);
+        let cursor_size = Size::from((cursor_width as u32, cursor_height as u32));
+        let resources = fd.resource_handles().map_err(|source| Error::Access {
             errmsg: "Error loading resource handles",
-            dev: dev.dev_path(),
+            dev: fd.dev_path(),
             source,
         })?;
-        let internal = Arc::new(DrmDevice::create_internal(
-            dev,
-            active,
-            disable_connectors,
-            log.clone(),
-        )?);
 
-        Ok(DrmDevice {
-            dev_id,
-            internal,
-            #[cfg(feature = "backend_session")]
-            links: RefCell::new(Vec::new()),
-            has_universal_planes,
-            has_monotonic_timestamps,
-            resources,
-            logger: log,
-            token: Token::invalid(),
-        })
+        let internal = Arc::new(DrmDevice::create_internal(fd, active, disable_connectors)?);
+
+        Ok((
+            DrmDevice {
+                dev_id,
+                internal: internal.clone(),
+                has_universal_planes,
+                cursor_size,
+                resources,
+                plane_claim_storage: Default::default(),
+            },
+            DrmDeviceNotifier {
+                internal,
+                has_monotonic_timestamps,
+                token: None,
+            },
+        ))
     }
 
     fn create_internal(
-        dev: Arc<FdWrapper<A>>,
+        fd: DrmDeviceFd,
         active: Arc<AtomicBool>,
         disable_connectors: bool,
-        log: ::slog::Logger,
-    ) -> Result<DrmDeviceInternal<A>, Error> {
+    ) -> Result<DrmDeviceInternal, Error> {
         let force_legacy = std::env::var("SMITHAY_USE_LEGACY")
             .map(|x| {
                 x == "1" || x.to_lowercase() == "true" || x.to_lowercase() == "yes" || x.to_lowercase() == "y"
@@ -179,15 +244,15 @@ impl<A: AsRawFd + 'static> DrmDevice<A> {
             .unwrap_or(false);
 
         if force_legacy {
-            info!(log, "SMITHAY_USE_LEGACY is set. Forcing LegacyDrmDevice.");
+            info!("SMITHAY_USE_LEGACY is set. Forcing LegacyDrmDevice.");
         };
 
         Ok(
-            if !force_legacy && dev.set_client_capability(ClientCapability::Atomic, true).is_ok() {
-                DrmDeviceInternal::Atomic(AtomicDrmDevice::new(dev, active, disable_connectors, log)?)
+            if !force_legacy && fd.set_client_capability(ClientCapability::Atomic, true).is_ok() {
+                DrmDeviceInternal::Atomic(AtomicDrmDevice::new(fd, active, disable_connectors)?)
             } else {
-                info!(log, "Falling back to LegacyDrmDevice");
-                DrmDeviceInternal::Legacy(LegacyDrmDevice::new(dev, active, disable_connectors, log)?)
+                info!("Falling back to LegacyDrmDevice");
+                DrmDeviceInternal::Legacy(LegacyDrmDevice::new(fd, active, disable_connectors)?)
             },
         )
     }
@@ -210,6 +275,22 @@ impl<A: AsRawFd + 'static> DrmDevice<A> {
         planes(self, crtc, self.has_universal_planes)
     }
 
+    /// Claim a plane so that it won't be used by a different crtc
+    ///  
+    /// Returns `None` if the plane could not be claimed
+    pub fn claim_plane(&self, plane: plane::Handle, crtc: crtc::Handle) -> Option<PlaneClaim> {
+        self.plane_claim_storage.claim(plane, crtc)
+    }
+
+    /// Returns the size of the hardware cursor
+    ///
+    /// Note: In case of universal planes this is the
+    /// maximum size of a buffer that can be used on
+    /// the cursor plane.
+    pub fn cursor_size(&self) -> Size<u32, Buffer> {
+        self.cursor_size
+    }
+
     /// Creates a new rendering surface.
     ///
     /// # Arguments
@@ -224,25 +305,32 @@ impl<A: AsRawFd + 'static> DrmDevice<A> {
     ///     has to be compatible with the provided `connectors`.
     /// - [`connectors`](drm::control::connector) - List of connectors driven by the crtc. At least one(!) connector needs to be \
     ///     attached to a crtc in smithay.
+    #[instrument(skip(self), parent = self.internal.span(), err)]
     pub fn create_surface(
         &self,
         crtc: crtc::Handle,
         mode: Mode,
         connectors: &[connector::Handle],
-    ) -> Result<DrmSurface<A>, Error> {
+    ) -> Result<DrmSurface, Error> {
         if connectors.is_empty() {
             return Err(Error::SurfaceWithoutConnectors(crtc));
         }
 
-        let plane = planes(self, &crtc, self.has_universal_planes)?.primary;
-        let info = self.get_plane(plane).map_err(|source| Error::Access {
-            errmsg: "Failed to get plane info",
-            dev: self.dev_path(),
-            source,
-        })?;
+        if !self.is_active() {
+            return Err(Error::DeviceInactive);
+        }
+
+        let planes = self.planes(&crtc)?;
+        let info = self
+            .get_plane(planes.primary.handle)
+            .map_err(|source| Error::Access {
+                errmsg: "Failed to get plane info",
+                dev: self.dev_path(),
+                source,
+            })?;
         let filter = info.possible_crtcs();
         if !self.resources.filter_crtcs(filter).contains(&crtc) {
-            return Err(Error::PlaneNotCompatible(crtc, plane));
+            return Err(Error::PlaneNotCompatible(crtc, planes.primary.handle));
         }
 
         let active = match &*self.internal {
@@ -260,11 +348,10 @@ impl<A: AsRawFd + 'static> DrmDevice<A> {
                 self.internal.clone(),
                 active,
                 crtc,
-                plane,
+                planes.primary.handle,
                 mapping,
                 mode,
                 connectors,
-                self.logger.clone(),
             )?)
         } else {
             DrmSurfaceInternal::Legacy(LegacyDrmSurface::new(
@@ -273,18 +360,15 @@ impl<A: AsRawFd + 'static> DrmDevice<A> {
                 crtc,
                 mode,
                 connectors,
-                self.logger.clone(),
             )?)
         };
 
         Ok(DrmSurface {
             dev_id: self.dev_id,
             crtc,
-            primary: plane,
+            planes,
             internal: Arc::new(internal),
-            has_universal_planes: self.has_universal_planes,
-            #[cfg(feature = "backend_session")]
-            links: RefCell::new(Vec::new()),
+            plane_claim_storage: self.plane_claim_storage.clone(),
         })
     }
 
@@ -292,19 +376,49 @@ impl<A: AsRawFd + 'static> DrmDevice<A> {
     pub fn device_id(&self) -> dev_t {
         self.dev_id
     }
-}
 
-/// Trait representing open devices that *may* return a `Path`
-pub trait DevPath {
-    /// Returns the path of the open device if possible
-    fn dev_path(&self) -> Option<PathBuf>;
-}
+    /// Returns the underlying file descriptor
+    pub fn device_fd(&self) -> &DrmDeviceFd {
+        self.internal.device_fd()
+    }
 
-impl<A: AsRawFd> DevPath for A {
-    fn dev_path(&self) -> Option<PathBuf> {
-        use std::fs;
+    /// Pauses the device.
+    ///
+    /// This will cause the `DrmDevice` to avoid making calls to the file descriptor e.g. on drop.
+    /// Note that calls directly utilizing the underlying file descriptor, like the traits of the `drm-rs` crate,
+    /// will ignore this state. Use [`DrmDevice::is_active`] to guard these calls.
+    pub fn pause(&self) {
+        self.set_active(false);
+        if self.device_fd().is_privileged() {
+            if let Err(err) = self.release_master_lock() {
+                error!("Failed to drop drm master state Error: {}", err);
+            }
+        }
+    }
 
-        fs::read_link(format!("/proc/self/fd/{:?}", self.as_raw_fd())).ok()
+    /// Actives a previously paused device.
+    pub fn activate(&self) {
+        if self.device_fd().is_privileged() {
+            if let Err(err) = self.acquire_master_lock() {
+                error!("Failed to acquire drm master again. Error: {}", err);
+            }
+        }
+        self.set_active(true);
+    }
+
+    /// Returns if the device is currently paused or not.
+    pub fn is_active(&self) -> bool {
+        match &*self.internal {
+            DrmDeviceInternal::Atomic(internal) => internal.active.load(Ordering::SeqCst),
+            DrmDeviceInternal::Legacy(internal) => internal.active.load(Ordering::SeqCst),
+        }
+    }
+
+    fn set_active(&self, active: bool) {
+        match &*self.internal {
+            DrmDeviceInternal::Atomic(internal) => internal.active.store(active, Ordering::SeqCst),
+            DrmDeviceInternal::Legacy(internal) => internal.active.store(active, Ordering::SeqCst),
+        }
     }
 }
 
@@ -318,7 +432,7 @@ pub enum DrmEvent {
 }
 
 /// Timing metadata for page-flip events
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct EventMetadata {
     /// The time the frame flip happend
     pub time: Time,
@@ -327,49 +441,46 @@ pub struct EventMetadata {
 }
 
 /// Either a realtime or monotonic timestamp
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Time {
     /// Monotonic time stamp
-    Monotonic(Instant),
+    Monotonic(Duration),
     /// Realtime time stamp
     Realtime(SystemTime),
 }
 
-impl<A> EventSource for DrmDevice<A>
-where
-    A: AsRawFd + 'static,
-{
+/// Even source of [`DrmDevice`]
+#[derive(Debug)]
+pub struct DrmDeviceNotifier {
+    internal: Arc<DrmDeviceInternal>,
+    has_monotonic_timestamps: bool,
+    token: Option<Token>,
+}
+
+impl EventSource for DrmDeviceNotifier {
     type Event = DrmEvent;
     type Metadata = Option<EventMetadata>;
     type Ret = ();
+    type Error = io::Error;
 
-    fn process_events<F>(
-        &mut self,
-        _: Readiness,
-        token: Token,
-        mut callback: F,
-    ) -> std::io::Result<PostAction>
+    fn process_events<F>(&mut self, _: Readiness, token: Token, mut callback: F) -> io::Result<PostAction>
     where
         F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
     {
-        if token != self.token {
+        let _guard = self.internal.span().enter();
+
+        if Some(token) != self.token {
             return Ok(PostAction::Continue);
         }
-        match self.receive_events() {
+
+        match self.internal.receive_events() {
             Ok(events) => {
                 for event in events {
                     if let Event::PageFlip(event) = event {
-                        trace!(self.logger, "Got a page-flip event for crtc ({:?})", event.crtc);
+                        trace!("Got a page-flip event for crtc ({:?})", event.crtc);
                         let metadata = EventMetadata {
                             time: if self.has_monotonic_timestamps {
-                                // There is no way to create an Instant, although the underlying type on unix systems
-                                // is just libc::timespec, which is literally what drm-rs is getting from the kernel and just converting
-                                // into a Duration. So we cheat and initialize a Zero-Instant (because although Instant::ZERO
-                                // exists, its private, so you cannot create abitrary Instants). What we really need is a unix-Ext
-                                // trait for both SystemTime and Instant to convert from a libc::timespec.
-                                //
-                                // But this works for now, although it is quite the hack.
-                                Time::Monotonic(unsafe { std::mem::zeroed::<Instant>() } + event.duration)
+                                Time::Monotonic(event.duration)
                             } else {
                                 Time::Realtime(SystemTime::UNIX_EPOCH + event.duration)
                             },
@@ -378,9 +489,8 @@ where
                         callback(DrmEvent::VBlank(event.crtc), &mut Some(metadata));
                     } else {
                         trace!(
-                            self.logger,
                             "Got a non-page-flip event of device '{:?}'.",
-                            self.dev_path()
+                            self.internal.dev_path()
                         );
                     }
                 }
@@ -389,7 +499,7 @@ where
                 callback(
                     DrmEvent::Error(Error::Access {
                         errmsg: "Error processing drm events",
-                        dev: self.dev_path(),
+                        dev: self.internal.dev_path(),
                         source,
                     }),
                     &mut None,
@@ -399,18 +509,31 @@ where
         Ok(PostAction::Continue)
     }
 
-    fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> std::io::Result<()> {
-        self.token = factory.token();
-        poll.register(self.as_raw_fd(), Interest::READ, calloop::Mode::Level, self.token)
+    fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
+        self.token = Some(factory.token());
+        // Safety: the FD cannot be closed without removing the DrmDeviceNotifier from the event loop
+        unsafe {
+            poll.register(
+                self.internal.as_fd(),
+                Interest::READ,
+                calloop::Mode::Level,
+                self.token.unwrap(),
+            )
+        }
     }
 
-    fn reregister(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> std::io::Result<()> {
-        self.token = factory.token();
-        poll.reregister(self.as_raw_fd(), Interest::READ, calloop::Mode::Level, self.token)
+    fn reregister(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
+        self.token = Some(factory.token());
+        poll.reregister(
+            self.internal.as_fd(),
+            Interest::READ,
+            calloop::Mode::Level,
+            self.token.unwrap(),
+        )
     }
 
-    fn unregister(&mut self, poll: &mut Poll) -> std::io::Result<()> {
-        self.token = Token::invalid();
-        poll.unregister(self.as_raw_fd())
+    fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
+        self.token = None;
+        poll.unregister(self.internal.as_fd())
     }
 }

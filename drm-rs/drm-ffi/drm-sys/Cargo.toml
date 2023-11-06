@@ -10,4 +10,4 @@ build = "build.rs"
 libc = { version = "0.2.120"}
 
 [build-dependencies]
-bindgen = "0.59.2"
+bindgen = "0.66"

@@ -7,4 +7,8 @@ authors = ["Gustavo Branco <guster32@gmail.com>"]
 
 [dependencies]
 drm-sys = { path = "drm-sys", version = "0.0.1" }
-nix = "^0.23.1"
+
+[dependencies.nix]
+version = "0.27"
+default-features = false
+features = ["ioctl"]

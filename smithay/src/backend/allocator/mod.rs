@@ -17,6 +17,7 @@
 
 pub mod dmabuf;
 pub mod dumb;
+pub mod format;
 pub mod gbm;
 
 mod swapchain;
@@ -27,7 +28,7 @@ use std::{
 };
 
 use crate::utils::{Buffer as BufferCoords, Size};
-pub use self::swapchain::{Slot, Swapchain};
+pub use swapchain::{Slot, Swapchain};
 
 pub use drm_fourcc::{
     DrmFormat as Format, DrmFourcc as Fourcc, DrmModifier as Modifier, DrmVendor as Vendor,
@@ -51,7 +52,9 @@ pub trait Buffer {
 }
 
 /// Interface to create Buffers
-pub trait Allocator<B: Buffer> {
+pub trait Allocator {
+    /// Buffer type produced by this allocator
+    type Buffer: Buffer;
     /// Error type thrown if allocations fail
     type Error: std::error::Error;
 
@@ -62,12 +65,13 @@ pub trait Allocator<B: Buffer> {
         height: u32,
         fourcc: Fourcc,
         modifiers: &[Modifier],
-    ) -> Result<B, Self::Error>;
+    ) -> Result<Self::Buffer, Self::Error>;
 }
 
 // General implementations for interior mutability.
 
-impl<A: Allocator<B>, B: Buffer> Allocator<B> for Arc<Mutex<A>> {
+impl<A: Allocator> Allocator for Arc<Mutex<A>> {
+    type Buffer = A::Buffer;
     type Error = A::Error;
 
     fn create_buffer(
@@ -76,13 +80,14 @@ impl<A: Allocator<B>, B: Buffer> Allocator<B> for Arc<Mutex<A>> {
         height: u32,
         fourcc: Fourcc,
         modifiers: &[Modifier],
-    ) -> Result<B, Self::Error> {
+    ) -> Result<Self::Buffer, Self::Error> {
         let mut guard = self.lock().unwrap();
         guard.create_buffer(width, height, fourcc, modifiers)
     }
 }
 
-impl<A: Allocator<B>, B: Buffer> Allocator<B> for Rc<RefCell<A>> {
+impl<A: Allocator> Allocator for Rc<RefCell<A>> {
+    type Buffer = A::Buffer;
     type Error = A::Error;
 
     fn create_buffer(
@@ -91,7 +96,25 @@ impl<A: Allocator<B>, B: Buffer> Allocator<B> for Rc<RefCell<A>> {
         height: u32,
         fourcc: Fourcc,
         modifiers: &[Modifier],
-    ) -> Result<B, Self::Error> {
-        self.borrow_mut().create_buffer(width, height, fourcc, modifiers)
+    ) -> Result<Self::Buffer, Self::Error> {
+        self.borrow_mut()
+            .create_buffer(width, height, fourcc, modifiers)
+    }
+}
+
+impl<B: Buffer, E: std::error::Error> Allocator
+    for Box<dyn Allocator<Buffer = B, Error = E> + 'static>
+{
+    type Buffer = B;
+    type Error = E;
+
+    fn create_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        fourcc: Fourcc,
+        modifiers: &[Modifier],
+    ) -> Result<B, E> {
+        (**self).create_buffer(width, height, fourcc, modifiers)
     }
 }

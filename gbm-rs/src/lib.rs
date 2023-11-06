@@ -22,15 +22,15 @@
 //! use gbm::{BufferObjectFlags, Device, Format};
 //!
 //! # use std::fs::{File, OpenOptions};
-//! # use std::os::unix::io::{AsRawFd, RawFd};
+//! # use std::os::unix::io::{AsFd, BorrowedFd, RawFd};
 //! #
 //! # use drm::control::Device as ControlDevice;
 //! # use drm::Device as BasicDevice;
 //! # struct Card(File);
 //! #
-//! # impl AsRawFd for Card {
-//! #     fn as_raw_fd(&self) -> RawFd {
-//! #         self.0.as_raw_fd()
+//! # impl AsFd for Card {
+//! #     fn as_fd(&self) -> BorrowedFd {
+//! #         self.0.as_fd()
 //! #     }
 //! # }
 //! #
@@ -78,7 +78,7 @@
 //! # let res_handles = gbm.resource_handles().unwrap();
 //! # let con = *res_handles.connectors().iter().next().unwrap();
 //! # let crtc_handle = *res_handles.crtcs().iter().next().unwrap();
-//! # let connector_info: ConnectorInfo = gbm.get_connector(con).unwrap();
+//! # let connector_info: ConnectorInfo = gbm.get_connector(con, false).unwrap();
 //! # let mode: Mode = connector_info.modes()[0];
 //! #
 //! // display it (and get a crtc, mode and connector before)
@@ -132,6 +132,9 @@ impl<T> Drop for PtrDrop<T> {
 
 #[derive(Clone)]
 pub(crate) struct Ptr<T>(Arc<PtrDrop<T>>);
+// SAFETY: The types used with Ptr in this crate are all Send (namely gbm_device, gbm_surface and gbm_bo).
+// The type is private and can thus not be used unsoundly by other crates.
+unsafe impl<T> Send for Ptr<T> {}
 
 impl<T> Ptr<T> {
     fn new<F: FnOnce(*mut T) + Send + 'static>(ptr: *mut T, destructor: F) -> Ptr<T> {

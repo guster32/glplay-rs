@@ -10,32 +10,98 @@ use super::{
 };
 use crate::utils::{Buffer as BufferCoords, Size};
 pub use gbm::{BufferObject as GbmBuffer, BufferObjectFlags as GbmBufferFlags, Device as GbmDevice};
-use std::os::unix::io::AsRawFd;
+use std::{
+    convert::{AsMut, AsRef},
+    os::unix::io::{AsFd, AsRawFd, BorrowedFd},
+};
+use tracing::instrument;
 
-impl<A: AsRawFd + 'static, T> Allocator<GbmBuffer<T>> for GbmDevice<A> {
+/// Light wrapper around an [`GbmDevice`] to implement the [`Allocator`]-trait
+#[derive(Clone, Debug)]
+pub struct GbmAllocator<A: AsFd + 'static> {
+    device: GbmDevice<A>,
+    default_flags: GbmBufferFlags,
+}
+
+impl<A: AsFd + 'static> AsRef<GbmDevice<A>> for GbmAllocator<A> {
+    fn as_ref(&self) -> &GbmDevice<A> {
+        &self.device
+    }
+}
+
+impl<A: AsFd + 'static> AsMut<GbmDevice<A>> for GbmAllocator<A> {
+    fn as_mut(&mut self) -> &mut GbmDevice<A> {
+        &mut self.device
+    }
+}
+
+impl<A: AsFd + 'static> AsFd for GbmAllocator<A> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.device.as_fd()
+    }
+}
+
+impl<A: AsFd + 'static> GbmAllocator<A> {
+    /// Create a new [`GbmAllocator`] from a [`GbmDevice`] with some default usage flags,
+    /// to be used when [`Allocator::create_buffer`] is invoked.
+    pub fn new(device: GbmDevice<A>, default_flags: GbmBufferFlags) -> GbmAllocator<A> {
+        GbmAllocator {
+            device,
+            default_flags,
+        }
+    }
+
+    /// Alternative to [`Allocator::create_buffer`], if you need a one-off buffer with
+    /// a different set of usage flags.
+    #[instrument(level = "trace", skip(self), fields(self.device = ?self.device, err))]
+    #[profiling::function]
+    pub fn create_buffer_with_flags(
+        &mut self,
+        width: u32,
+        height: u32,
+        fourcc: Fourcc,
+        modifiers: &[Modifier],
+        flags: GbmBufferFlags,
+    ) -> Result<GbmBuffer<()>, std::io::Error> {
+        #[cfg(feature = "backend_gbm_has_create_with_modifiers2")]
+        let result = self.device.create_buffer_object_with_modifiers2(
+            width,
+            height,
+            fourcc,
+            modifiers.iter().copied(),
+            flags,
+        );
+        #[cfg(not(feature = "backend_gbm_has_create_with_modifiers2"))]
+        let result =
+            self.device
+                .create_buffer_object_with_modifiers(width, height, fourcc, modifiers.iter().copied());
+
+        match result {
+            Ok(bo) => Ok(bo),
+            Err(err) => {
+                if modifiers.contains(&Modifier::Invalid) || modifiers.contains(&Modifier::Linear) {
+                    self.device.create_buffer_object(width, height, fourcc, flags)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+impl<A: AsFd + 'static> Allocator for GbmAllocator<A> {
+    type Buffer = GbmBuffer<()>;
     type Error = std::io::Error;
 
+    #[profiling::function]
     fn create_buffer(
         &mut self,
         width: u32,
         height: u32,
         fourcc: Fourcc,
         modifiers: &[Modifier],
-    ) -> Result<GbmBuffer<T>, Self::Error> {
-        match self.create_buffer_object_with_modifiers(width, height, fourcc, modifiers.iter().copied()) {
-            Ok(bo) => Ok(bo),
-            Err(err) => {
-                if modifiers.contains(&Modifier::Invalid) || modifiers.contains(&Modifier::Linear) {
-                    let mut usage = GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING;
-                    if !modifiers.contains(&Modifier::Invalid) {
-                        usage |= GbmBufferFlags::LINEAR;
-                    }
-                    self.create_buffer_object(width, height, fourcc, usage)
-                } else {
-                    Err(err)
-                }
-            }
-        }
+    ) -> Result<GbmBuffer<()>, Self::Error> {
+        self.create_buffer_with_flags(width, height, fourcc, modifiers, self.default_flags)
     }
 }
 
@@ -67,16 +133,48 @@ pub enum GbmConvertError {
     UnsupportedBuffer,
     /// The conversion returned an invalid file descriptor
     #[error("Buffer returned invalid file descriptor")]
-    InvalidFD,
+    InvalidFD(#[from] gbm::InvalidFdError),
+}
+
+impl From<gbm::FdError> for GbmConvertError {
+    fn from(err: gbm::FdError) -> Self {
+        match err {
+            gbm::FdError::DeviceDestroyed(err) => err.into(),
+            gbm::FdError::InvalidFd(err) => err.into(),
+        }
+    }
 }
 
 impl<T> AsDmabuf for GbmBuffer<T> {
     type Error = GbmConvertError;
 
+    #[cfg(feature = "backend_gbm_has_fd_for_plane")]
+    #[profiling::function]
     fn export(&self) -> Result<Dmabuf, GbmConvertError> {
         let planes = self.plane_count()? as i32;
 
-        //TODO switch to gbm_bo_get_plane_fd when it lands
+        let mut builder = Dmabuf::builder_from_buffer(self, DmabufFlags::empty());
+        for idx in 0..planes {
+            let fd = self.fd_for_plane(idx)?;
+
+            builder.add_plane(
+                // SAFETY: `gbm_bo_get_fd_for_plane` returns a new fd owned by the caller.
+                fd,
+                idx as u32,
+                self.offset(idx)?,
+                self.stride_for_plane(idx)?,
+                self.modifier()?,
+            );
+        }
+
+        Ok(builder.build().unwrap())
+    }
+
+    #[cfg(not(feature = "backend_gbm_has_fd_for_plane"))]
+    #[profiling::function]
+    fn export(&self) -> Result<Dmabuf, GbmConvertError> {
+        let planes = self.plane_count()? as i32;
+
         let mut iter = (0i32..planes).map(|i| self.handle_for_plane(i));
         let first = iter.next().expect("Encountered a buffer with zero planes");
         // check that all handles are the same
@@ -93,21 +191,15 @@ impl<T> AsDmabuf for GbmBuffer<T> {
             // check all planes have the same handle. We can't use
             // drmPrimeHandleToFD because that messes up handle ref'counting in
             // the user-space driver.
-            return Err(GbmConvertError::UnsupportedBuffer); //TODO
-        }
-
-        // Make sure to only call fd once as each call will create
-        // a new file descriptor which has to be closed
-        let fd = self.fd()?;
-
-        // gbm_bo_get_fd returns -1 if an error occurs
-        if fd == -1 {
-            return Err(GbmConvertError::InvalidFD);
+            return Err(GbmConvertError::UnsupportedBuffer);
         }
 
         let mut builder = Dmabuf::builder_from_buffer(self, DmabufFlags::empty());
         for idx in 0..planes {
+            let fd = self.fd()?;
+
             builder.add_plane(
+                // SAFETY: `gbm_bo_get_fd` returns a new fd owned by the caller.
                 fd,
                 idx as u32,
                 self.offset(idx)?,
@@ -121,14 +213,15 @@ impl<T> AsDmabuf for GbmBuffer<T> {
 
 impl Dmabuf {
     /// Import a Dmabuf using libgbm, creating a gbm Buffer Object to the same underlying data.
-    pub fn import_to<A: AsRawFd + 'static, T>(
+    #[profiling::function]
+    pub fn import_to<A: AsFd + 'static, T>(
         &self,
         gbm: &GbmDevice<A>,
         usage: GbmBufferFlags,
     ) -> std::io::Result<GbmBuffer<T>> {
         let mut handles = [0; MAX_PLANES];
         for (i, handle) in self.handles().take(MAX_PLANES).enumerate() {
-            handles[i] = handle;
+            handles[i] = handle.as_raw_fd();
         }
         let mut strides = [0i32; MAX_PLANES];
         for (i, stride) in self.strides().take(MAX_PLANES).enumerate() {

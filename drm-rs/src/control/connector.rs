@@ -14,6 +14,10 @@ use drm_ffi as ffi;
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct Handle(control::RawResourceHandle);
 
+// Safety: Handle is repr(transparent) over NonZeroU32
+unsafe impl bytemuck::ZeroableInOption for Handle {}
+unsafe impl bytemuck::PodInOption for Handle {}
+
 impl From<Handle> for control::RawResourceHandle {
     fn from(handle: Handle) -> Self {
         handle.0
@@ -51,8 +55,9 @@ pub struct Info {
     pub(crate) connection: State,
     pub(crate) size: Option<(u32, u32)>,
     pub(crate) modes: Vec<control::Mode>,
-    pub(crate) encoders: [Option<control::encoder::Handle>; 3],
+    pub(crate) encoders: Vec<control::encoder::Handle>,
     pub(crate) curr_enc: Option<control::encoder::Handle>,
+    pub(crate) subpixel: SubPixel,
 }
 
 impl Info {
@@ -85,7 +90,7 @@ impl Info {
     }
 
     /// Returns a list of encoders that can be possibly used by this connector.
-    pub fn encoders(&self) -> &[Option<control::encoder::Handle>] {
+    pub fn encoders(&self) -> &[control::encoder::Handle] {
         &self.encoders
     }
 
@@ -98,11 +103,17 @@ impl Info {
     pub fn current_encoder(&self) -> Option<control::encoder::Handle> {
         self.curr_enc
     }
+
+    /// Subpixel order of the connected sink
+    pub fn subpixel(&self) -> SubPixel {
+        self.subpixel
+    }
 }
 
 /// A physical interface type.
 #[allow(missing_docs)]
 #[allow(clippy::upper_case_acronyms)]
+#[non_exhaustive]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum Interface {
     Unknown,
@@ -123,6 +134,39 @@ pub enum Interface {
     Virtual,
     DSI,
     DPI,
+    Writeback,
+    SPI,
+    USB,
+}
+
+impl Interface {
+    /// Get interface name as string
+    pub fn as_str(&self) -> &'static str {
+        // source: https://github.com/torvalds/linux/blob/489fa31ea873282b41046d412ec741f93946fc2d/drivers/gpu/drm/drm_connector.c#L89
+        match self {
+            Interface::Unknown => "Unknown",
+            Interface::VGA => "VGA",
+            Interface::DVII => "DVI-I",
+            Interface::DVID => "DVI-D",
+            Interface::DVIA => "DVI-A",
+            Interface::Composite => "Composite",
+            Interface::SVideo => "SVIDEO",
+            Interface::LVDS => "LVDS",
+            Interface::Component => "Component",
+            Interface::NinePinDIN => "DIN",
+            Interface::DisplayPort => "DP",
+            Interface::HDMIA => "HDMI-A",
+            Interface::HDMIB => "HDMI-B",
+            Interface::TV => "TV",
+            Interface::EmbeddedDisplayPort => "eDP",
+            Interface::Virtual => "Virtual",
+            Interface::DSI => "DSI",
+            Interface::DPI => "DPI",
+            Interface::Writeback => "Writeback",
+            Interface::SPI => "SPI",
+            Interface::USB => "USB",
+        }
+    }
 }
 
 impl From<u32> for Interface {
@@ -146,6 +190,9 @@ impl From<u32> for Interface {
             ffi::DRM_MODE_CONNECTOR_VIRTUAL => Interface::Virtual,
             ffi::DRM_MODE_CONNECTOR_DSI => Interface::DSI,
             ffi::DRM_MODE_CONNECTOR_DPI => Interface::DPI,
+            ffi::DRM_MODE_CONNECTOR_WRITEBACK => Interface::Writeback,
+            ffi::DRM_MODE_CONNECTOR_SPI => Interface::SPI,
+            ffi::DRM_MODE_CONNECTOR_USB => Interface::USB,
             _ => Interface::Unknown,
         }
     }
@@ -172,6 +219,9 @@ impl From<Interface> for u32 {
             Interface::Virtual => ffi::DRM_MODE_CONNECTOR_VIRTUAL,
             Interface::DSI => ffi::DRM_MODE_CONNECTOR_DSI,
             Interface::DPI => ffi::DRM_MODE_CONNECTOR_DPI,
+            Interface::Writeback => ffi::DRM_MODE_CONNECTOR_WRITEBACK,
+            Interface::SPI => ffi::DRM_MODE_CONNECTOR_SPI,
+            Interface::USB => ffi::DRM_MODE_CONNECTOR_USB,
         }
     }
 }
@@ -205,6 +255,43 @@ impl From<State> for u32 {
             State::Connected => 1,
             State::Disconnected => 2,
             State::Unknown => 3,
+        }
+    }
+}
+
+/// Subpixel order of the connected sink
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum SubPixel {
+    /// Unknown geometry
+    Unknown,
+    /// Horizontal RGB
+    HorizontalRgb,
+    /// Horizontal BGR
+    HorizontalBgr,
+    /// Vertical RGB
+    VerticalRgb,
+    /// Vertical BGR
+    VerticalBgr,
+    /// No geometry
+    None,
+    /// Encountered value not supported by drm-rs
+    NotImplemented,
+}
+
+impl SubPixel {
+    pub(super) fn from_raw(n: u32) -> Self {
+        // These values are not defined in drm_mode.h
+        // They were copied from linux's drm_connector.h
+        // Don't mistake those for ones used in xf86DrmMode.h (libdrm offsets those by 1)
+        match n {
+            0 => Self::Unknown,
+            1 => Self::HorizontalRgb,
+            2 => Self::HorizontalBgr,
+            3 => Self::VerticalRgb,
+            4 => Self::VerticalBgr,
+            5 => Self::None,
+            _ => Self::NotImplemented,
         }
     }
 }

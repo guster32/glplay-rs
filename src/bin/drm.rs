@@ -1,4 +1,9 @@
-use std::os::fd::{AsRawFd, RawFd};
+#[macro_use]
+extern crate slog;
+
+use slog::Drain;
+
+use std::sync::Mutex;
 
 extern crate drm_rs;
 
@@ -10,6 +15,18 @@ use drm_rs::control::{
 };
 use drm_rs::Device;
 
+/// Implementing `AsFd` is a prerequisite to implementing the traits found
+/// in this crate. Here, we are just calling `as_fd()` on the inner File.
+impl std::os::unix::io::AsFd for Card {
+    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+/// With `AsFd` implemented, we can now implement `drm::Device`.
+impl Device for Card {}
+impl ControlDevice for Card {}
+
 /// Simple helper methods for opening a `Card`.
 impl Card {
     pub fn open(path: &str) -> Self {
@@ -18,18 +35,15 @@ impl Card {
         options.write(true);
         Card(options.open(path).unwrap())
     }
-}
 
-impl AsRawFd for Card {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+    pub fn open_global() -> Self {
+        Self::open("/dev/dri/card0")
     }
 }
 
-impl drm_rs::Device for Card {}
-impl ControlDevice for Card {}
-
+///////////////////////////////   MAIN  ///////////////////////////////
 fn main() {
+    let log = slog::Logger::root(Mutex::new(slog_term::term_full().fuse()).fuse(), o!());
     let gpu = Card::open("/dev/dri/card0");
     let drv = gpu.get_driver().unwrap();
     println!("{:#?}", drv.description());
@@ -41,8 +55,9 @@ fn main() {
     let connector_info = res_handles
         .connectors()
         .iter()
-        .map(|conn| gpu.get_connector(*conn).unwrap())
+        .map(|conn| gpu.get_connector(*conn, false).unwrap())
         .find(|conn| conn.state() == ConnectorState::Connected)
         .unwrap();
-    println!("{:#?}", connector_info);
+    info!(log, "{:#?}", connector_info);
 }
+///////////////////////////////   MAIN  ///////////////////////////////

@@ -1,5 +1,5 @@
 use std::fmt;
-use std::ops::{Add, AddAssign, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 
 /// Type-level marker for the logical coordinate space
 #[derive(Debug)]
@@ -19,7 +19,13 @@ pub struct Raw;
 
 /// Trait for types serving as a coordinate for other geometry utils
 pub trait Coordinate:
-    Sized + Add<Self, Output = Self> + Sub<Self, Output = Self> + PartialOrd + Default + Copy + fmt::Debug
+    Sized
+    + Add<Self, Output = Self>
+    + Sub<Self, Output = Self>
+    + PartialOrd
+    + Default
+    + Copy
+    + fmt::Debug
 {
     /// Downscale the coordinate
     fn downscale(self, scale: Self) -> Self;
@@ -250,6 +256,63 @@ floating_point_coordinate_impl! {
 }
 
 /*
+ * Scale
+ */
+
+/// A two-dimensional scale that can be
+/// used to scale [`Point`]s, [`Size`]s and
+/// [`Rectangle`]s
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scale<N: Coordinate> {
+    /// The scale on the x axis
+    pub x: N,
+    /// The scale on the y axis
+    pub y: N,
+}
+
+impl<N: Coordinate> Scale<N> {
+    /// Convert the underlying numerical type to f64 for floating point manipulations
+    #[inline]
+    pub fn to_f64(self) -> Scale<f64> {
+        Scale {
+            x: self.x.to_f64(),
+            y: self.y.to_f64(),
+        }
+    }
+}
+
+impl<N: Coordinate> From<N> for Scale<N> {
+    fn from(scale: N) -> Self {
+        Scale { x: scale, y: scale }
+    }
+}
+
+impl<N: Coordinate> From<(N, N)> for Scale<N> {
+    fn from((scale_x, scale_y): (N, N)) -> Self {
+        Scale {
+            x: scale_x,
+            y: scale_y,
+        }
+    }
+}
+
+impl<N, T> Mul<T> for Scale<N>
+where
+    N: Coordinate,
+    T: Into<Scale<N>>,
+{
+    type Output = Scale<N>;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        let rhs = rhs.into();
+        Scale {
+            x: self.x.upscale(rhs.x),
+            y: self.y.upscale(rhs.y),
+        }
+    }
+}
+
+/*
  * Point
  */
 
@@ -291,6 +354,28 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
         Size {
             w: self.x.abs(),
             h: self.y.abs(),
+            _kind: std::marker::PhantomData,
+        }
+    }
+
+    /// Upscale this [`Point`] by a specified [`Scale`]
+    #[inline]
+    pub fn upscale(self, scale: impl Into<Scale<N>>) -> Point<N, Kind> {
+        let scale = scale.into();
+        Point {
+            x: self.x.upscale(scale.x),
+            y: self.y.upscale(scale.y),
+            _kind: std::marker::PhantomData,
+        }
+    }
+
+    /// Downscale this [`Point`] by a specified [`Scale`]
+    #[inline]
+    pub fn downscale(self, scale: impl Into<Scale<N>>) -> Point<N, Kind> {
+        let scale = scale.into();
+        Point {
+            x: self.x.downscale(scale.x),
+            y: self.y.downscale(scale.y),
             _kind: std::marker::PhantomData,
         }
     }
@@ -357,36 +442,10 @@ impl<Kind> Point<f64, Kind> {
     }
 }
 
-impl<N: fmt::Debug> fmt::Debug for Point<N, Logical> {
+impl<N: fmt::Debug, S> fmt::Debug for Point<N, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Point<Logical>")
-            .field("x", &self.x)
-            .field("y", &self.y)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Point<N, Physical> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Point<Physical>")
-            .field("x", &self.x)
-            .field("y", &self.y)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Point<N, Raw> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Point<Raw>")
-            .field("x", &self.x)
-            .field("y", &self.y)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Point<N, Buffer> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Point<Buffer>")
+        f.write_fmt(format_args!("Point<{}>", std::any::type_name::<S>()))?;
+        f.debug_struct("")
             .field("x", &self.x)
             .field("y", &self.y)
             .finish()
@@ -396,21 +455,64 @@ impl<N: fmt::Debug> fmt::Debug for Point<N, Buffer> {
 impl<N: Coordinate> Point<N, Logical> {
     #[inline]
     /// Convert this logical point to physical coordinate space according to given scale factor
-    pub fn to_physical(self, scale: N) -> Point<N, Physical> {
+    pub fn to_physical(self, scale: impl Into<Scale<N>>) -> Point<N, Physical> {
+        let scale = scale.into();
         Point {
-            x: self.x.upscale(scale),
-            y: self.y.upscale(scale),
+            x: self.x.upscale(scale.x),
+            y: self.y.upscale(scale.y),
             _kind: std::marker::PhantomData,
         }
     }
 
+    /// Convert this logical point to physical coordinate space according to given scale factor
+    /// and round the result
+    #[inline]
+    pub fn to_physical_precise_round<S: Coordinate, R: Coordinate>(
+        self,
+        scale: impl Into<Scale<S>>,
+    ) -> Point<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_round()
+    }
+
+    /// Convert this logical point to physical coordinate space according to given scale factor
+    /// and ceil the result
+    #[inline]
+    pub fn to_physical_precise_ceil<S: Coordinate, R: Coordinate>(
+        &self,
+        scale: impl Into<Scale<S>>,
+    ) -> Point<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_ceil()
+    }
+
+    /// Convert this logical point to physical coordinate space according to given scale factor
+    /// and floor the result
+    #[inline]
+    pub fn to_physical_precise_floor<S: Coordinate, R: Coordinate>(
+        &self,
+        scale: impl Into<Scale<S>>,
+    ) -> Point<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_floor()
+    }
+
     #[inline]
     /// Convert this logical point to buffer coordinate space according to given scale factor
-    pub fn to_buffer(self, scale: N, transformation: Transform, area: &Size<N, Logical>) -> Point<N, Buffer> {
+    pub fn to_buffer(
+        self,
+        scale: impl Into<Scale<N>>,
+        transformation: Transform,
+        area: &Size<N, Logical>,
+    ) -> Point<N, Buffer> {
         let point = transformation.transform_point_in(self, area);
+        let scale = scale.into();
         Point {
-            x: point.x.upscale(scale),
-            y: point.y.upscale(scale),
+            x: point.x.upscale(scale.x),
+            y: point.y.upscale(scale.y),
             _kind: std::marker::PhantomData,
         }
     }
@@ -419,10 +521,11 @@ impl<N: Coordinate> Point<N, Logical> {
 impl<N: Coordinate> Point<N, Physical> {
     #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
-    pub fn to_logical(self, scale: N) -> Point<N, Logical> {
+    pub fn to_logical(self, scale: impl Into<Scale<N>>) -> Point<N, Logical> {
+        let scale = scale.into();
         Point {
-            x: self.x.downscale(scale),
-            y: self.y.downscale(scale),
+            x: self.x.downscale(scale.x),
+            y: self.y.downscale(scale.y),
             _kind: std::marker::PhantomData,
         }
     }
@@ -431,11 +534,17 @@ impl<N: Coordinate> Point<N, Physical> {
 impl<N: Coordinate> Point<N, Buffer> {
     #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
-    pub fn to_logical(self, scale: N, transform: Transform, area: &Size<N, Buffer>) -> Point<N, Logical> {
+    pub fn to_logical(
+        self,
+        scale: impl Into<Scale<N>>,
+        transform: Transform,
+        area: &Size<N, Buffer>,
+    ) -> Point<N, Logical> {
         let point = transform.invert().transform_point_in(self, area);
+        let scale = scale.into();
         Point {
-            x: point.x.downscale(scale),
-            y: point.y.downscale(scale),
+            x: point.x.downscale(scale.x),
+            y: point.y.downscale(scale.y),
             _kind: std::marker::PhantomData,
         }
     }
@@ -564,7 +673,11 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
 
 impl<N: Coordinate, Kind> Size<N, Kind> {
     /// Restrict this [`Size`] to min and max [`Size`] with the same coordinates
-    pub fn clamp(self, min: impl Into<Size<N, Kind>>, max: impl Into<Size<N, Kind>>) -> Size<N, Kind> {
+    pub fn clamp(
+        self,
+        min: impl Into<Size<N, Kind>>,
+        max: impl Into<Size<N, Kind>>,
+    ) -> Size<N, Kind> {
         let min = min.into();
         let max = max.into();
 
@@ -585,6 +698,38 @@ impl<N: Coordinate, Kind> Size<N, Kind> {
             h: self.h.to_f64(),
             _kind: std::marker::PhantomData,
         }
+    }
+}
+
+impl<N: Coordinate, Kind> Size<N, Kind> {
+    /// Upscale this [`Size`] by a specified [`Scale`]
+    #[inline]
+    pub fn upscale(self, scale: impl Into<Scale<N>>) -> Size<N, Kind> {
+        let scale = scale.into();
+        Size {
+            w: self.w.upscale(scale.x),
+            h: self.h.upscale(scale.y),
+            _kind: std::marker::PhantomData,
+        }
+    }
+
+    /// Downscale this [`Size`] by a specified [`Scale`]
+    #[inline]
+    pub fn downscale(self, scale: impl Into<Scale<N>>) -> Size<N, Kind> {
+        let scale = scale.into();
+        Size {
+            w: self.w.downscale(scale.x),
+            h: self.h.downscale(scale.y),
+            _kind: std::marker::PhantomData,
+        }
+    }
+
+    /// Check if this [`Size`] is empty
+    ///
+    /// Returns true if either the width or the height is zero
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.w == N::default() || self.h == N::default()
     }
 }
 
@@ -620,36 +765,10 @@ impl<Kind> Size<f64, Kind> {
     }
 }
 
-impl<N: fmt::Debug> fmt::Debug for Size<N, Logical> {
+impl<N: fmt::Debug, S> fmt::Debug for Size<N, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Size<Logical>")
-            .field("w", &self.w)
-            .field("h", &self.h)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Size<N, Physical> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Size<Physical>")
-            .field("w", &self.w)
-            .field("h", &self.h)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Size<N, Raw> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Size<Raw>")
-            .field("w", &self.w)
-            .field("h", &self.h)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Size<N, Buffer> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Size<Buffer>")
+        f.write_fmt(format_args!("Size<{}>", std::any::type_name::<S>()))?;
+        f.debug_struct("")
             .field("w", &self.w)
             .field("h", &self.h)
             .finish()
@@ -659,20 +778,62 @@ impl<N: fmt::Debug> fmt::Debug for Size<N, Buffer> {
 impl<N: Coordinate> Size<N, Logical> {
     #[inline]
     /// Convert this logical size to physical coordinate space according to given scale factor
-    pub fn to_physical(self, scale: N) -> Size<N, Physical> {
+    pub fn to_physical(self, scale: impl Into<Scale<N>>) -> Size<N, Physical> {
+        let scale = scale.into();
         Size {
-            w: self.w.upscale(scale),
-            h: self.h.upscale(scale),
+            w: self.w.upscale(scale.x),
+            h: self.h.upscale(scale.y),
             _kind: std::marker::PhantomData,
         }
     }
 
+    /// Convert this logical size to physical coordinate space according to given scale factor
+    /// and round the result
+    #[inline]
+    pub fn to_physical_precise_round<S: Coordinate, R: Coordinate>(
+        self,
+        scale: impl Into<Scale<S>>,
+    ) -> Size<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_round()
+    }
+
+    /// Convert this logical size to physical coordinate space according to given scale factor
+    /// and ceil the result
+    #[inline]
+    pub fn to_physical_precise_ceil<S: Coordinate, R: Coordinate>(
+        &self,
+        scale: impl Into<Scale<S>>,
+    ) -> Size<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_ceil()
+    }
+
+    /// Convert this logical size to physical coordinate space according to given scale factor
+    /// and floor the result
+    #[inline]
+    pub fn to_physical_precise_floor<S: Coordinate, R: Coordinate>(
+        &self,
+        scale: impl Into<Scale<S>>,
+    ) -> Size<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_floor()
+    }
+
     #[inline]
     /// Convert this logical size to buffer coordinate space according to given scale factor
-    pub fn to_buffer(self, scale: N, transformation: Transform) -> Size<N, Buffer> {
+    pub fn to_buffer(
+        self,
+        scale: impl Into<Scale<N>>,
+        transformation: Transform,
+    ) -> Size<N, Buffer> {
+        let scale = scale.into();
         transformation.transform_size(Size {
-            w: self.w.upscale(scale),
-            h: self.h.upscale(scale),
+            w: self.w.upscale(scale.x),
+            h: self.h.upscale(scale.y),
             _kind: std::marker::PhantomData,
         })
     }
@@ -681,10 +842,11 @@ impl<N: Coordinate> Size<N, Logical> {
 impl<N: Coordinate> Size<N, Physical> {
     #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
-    pub fn to_logical(self, scale: N) -> Size<N, Logical> {
+    pub fn to_logical(self, scale: impl Into<Scale<N>>) -> Size<N, Logical> {
+        let scale = scale.into();
         Size {
-            w: self.w.downscale(scale),
-            h: self.h.downscale(scale),
+            w: self.w.downscale(scale.x),
+            h: self.h.downscale(scale.y),
             _kind: std::marker::PhantomData,
         }
     }
@@ -693,10 +855,15 @@ impl<N: Coordinate> Size<N, Physical> {
 impl<N: Coordinate> Size<N, Buffer> {
     #[inline]
     /// Convert this physical point to logical coordinate space according to given scale factor
-    pub fn to_logical(self, scale: N, transformation: Transform) -> Size<N, Logical> {
+    pub fn to_logical(
+        self,
+        scale: impl Into<Scale<N>>,
+        transformation: Transform,
+    ) -> Size<N, Logical> {
+        let scale = scale.into();
         transformation.invert().transform_size(Size {
-            w: self.w.downscale(scale),
-            h: self.h.downscale(scale),
+            w: self.w.downscale(scale.x),
+            h: self.h.downscale(scale.y),
             _kind: std::marker::PhantomData,
         })
     }
@@ -760,6 +927,18 @@ impl<N: Coordinate, Kind> SubAssign for Size<N, Kind> {
     }
 }
 
+impl<N: Coordinate + Div<Output = N>, KindLhs, KindRhs> Div<Size<N, KindRhs>> for Size<N, KindLhs> {
+    type Output = Scale<N>;
+
+    #[inline]
+    fn div(self, rhs: Size<N, KindRhs>) -> Self::Output {
+        Scale {
+            x: self.w / rhs.w,
+            y: self.h / rhs.h,
+        }
+    }
+}
+
 impl<N: Clone, Kind> Clone for Size<N, Kind> {
     #[inline]
     fn clone(&self) -> Self {
@@ -817,7 +996,7 @@ impl<N: Coordinate, Kind> Sub<Size<N, Kind>> for Point<N, Kind> {
 
 /// A rectangle defined by its top-left corner and dimensions
 ///
-/// Operations on retangles are saturating.
+/// Operations on rectangles are saturating.
 #[repr(C)]
 pub struct Rectangle<N, Kind> {
     /// Location of the top-left corner of the rectangle
@@ -836,6 +1015,34 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     }
 }
 
+impl<N: Coordinate, Kind> Rectangle<N, Kind> {
+    /// Upscale this [`Rectangle`] by the supplied [`Scale`]
+    pub fn upscale(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Kind> {
+        let scale = scale.into();
+        Rectangle {
+            loc: self.loc.upscale(scale),
+            size: self.size.upscale(scale),
+        }
+    }
+
+    /// Downscale this [`Rectangle`] by the supplied [`Scale`]
+    pub fn downscale(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Kind> {
+        let scale = scale.into();
+        Rectangle {
+            loc: self.loc.downscale(scale),
+            size: self.size.downscale(scale),
+        }
+    }
+
+    /// Check if this [`Rectangle`] is empty
+    ///
+    /// Returns true if either the width or the height
+    /// of the [`Size`] is zero
+    pub fn is_empty(&self) -> bool {
+        self.size.is_empty()
+    }
+}
+
 impl<Kind> Rectangle<f64, Kind> {
     /// Convert to i32 for integer-space manipulations by rounding float values
     #[inline]
@@ -849,20 +1056,29 @@ impl<Kind> Rectangle<f64, Kind> {
     /// Convert to i32 by returning the largest integer-space rectangle fitting into the float-based rectangle
     #[inline]
     pub fn to_i32_down<N: Coordinate>(self) -> Rectangle<N, Kind> {
-        Rectangle::from_extemities(self.loc.to_i32_ceil(), (self.loc + self.size).to_i32_floor())
+        Rectangle::from_extemities(
+            self.loc.to_i32_ceil(),
+            (self.loc + self.size).to_i32_floor(),
+        )
     }
 
     /// Convert to i32 by returning the smallest integet-space rectangle encapsulating the float-based rectangle
     #[inline]
     pub fn to_i32_up<N: Coordinate>(self) -> Rectangle<N, Kind> {
-        Rectangle::from_extemities(self.loc.to_i32_floor(), (self.loc + self.size).to_i32_ceil())
+        Rectangle::from_extemities(
+            self.loc.to_i32_floor(),
+            (self.loc + self.size).to_i32_ceil(),
+        )
     }
 }
 
 impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     /// Create a new [`Rectangle`] from the coordinates of its top-left corner and its dimensions
     #[inline]
-    pub fn from_loc_and_size(loc: impl Into<Point<N, Kind>>, size: impl Into<Size<N, Kind>>) -> Self {
+    pub fn from_loc_and_size(
+        loc: impl Into<Point<N, Kind>>,
+        size: impl Into<Size<N, Kind>>,
+    ) -> Self {
         Rectangle {
             loc: loc.into(),
             size: size.into(),
@@ -894,28 +1110,46 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     }
 
     /// Checks whether given [`Rectangle`] is inside the rectangle
+    ///
+    /// A rectangle is considered inside another rectangle
+    /// if its location is inside the other rectangle and it does not
+    /// extend outside the other rectangle.
+    /// This includes rectangles with the same location and size
     #[inline]
     pub fn contains_rect<R: Into<Rectangle<N, Kind>>>(self, rect: R) -> bool {
         let r: Rectangle<N, Kind> = rect.into();
-        self.contains(r.loc) && self.contains(r.loc + r.size)
+        r.loc.x >= self.loc.x
+            && r.loc.y >= self.loc.y
+            && r.loc.x.saturating_add(r.size.w) <= self.loc.x.saturating_add(self.size.w)
+            && r.loc.y.saturating_add(r.size.h) <= self.loc.y.saturating_add(self.size.h)
     }
 
     /// Checks whether a given [`Rectangle`] overlaps with this one
+    ///
+    /// Note: This operation is exclusive, touching only rectangles will return `false`.
+    /// For inclusive overlap test see [`overlaps_or_touches`](Rectangle::overlaps_or_touches)
     #[inline]
     pub fn overlaps(self, other: impl Into<Rectangle<N, Kind>>) -> bool {
         let other = other.into();
-        // if the rectangle is not outside of the other
-        // they must overlap
-        !(
-            // self is left of other
-            self.loc.x.saturating_add(self.size.w) < other.loc.x
-            // self is right of other
-            ||  self.loc.x > other.loc.x.saturating_add(other.size.w)
-            // self is above of other
-            ||  self.loc.y.saturating_add(self.size.h) < other.loc.y
-            // self is below of other
-            ||  self.loc.y > other.loc.y.saturating_add(other.size.h)
-        )
+
+        self.loc.x < other.loc.x.saturating_add(other.size.w)
+            && other.loc.x < self.loc.x.saturating_add(self.size.w)
+            && self.loc.y < other.loc.y.saturating_add(other.size.h)
+            && other.loc.y < self.loc.y.saturating_add(self.size.h)
+    }
+
+    /// Checks whether a given [`Rectangle`] overlaps with this one or touches it
+    ///
+    /// Note: This operation is inclusive, touching only rectangles will return `true`.
+    /// For exclusive overlap test see [`overlaps`](Rectangle::overlaps)
+    #[inline]
+    pub fn overlaps_or_touches(self, other: impl Into<Rectangle<N, Kind>>) -> bool {
+        let other = other.into();
+
+        self.loc.x <= other.loc.x.saturating_add(other.size.w)
+            && other.loc.x <= self.loc.x.saturating_add(self.size.w)
+            && self.loc.y <= other.loc.y.saturating_add(other.size.h)
+            && other.loc.y <= self.loc.y.saturating_add(self.size.h)
     }
 
     /// Clamp rectangle to min and max corners resulting in the overlapping area of two rectangles
@@ -930,8 +1164,10 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
         Some(Rectangle::from_extemities(
             (self.loc.x.max(other.loc.x), self.loc.y.max(other.loc.y)),
             (
-                (self.loc.x.saturating_add(self.size.w)).min(other.loc.x.saturating_add(other.size.w)),
-                (self.loc.y.saturating_add(self.size.h)).min(other.loc.y.saturating_add(other.size.h)),
+                (self.loc.x.saturating_add(self.size.w))
+                    .min(other.loc.x.saturating_add(other.size.w)),
+                (self.loc.y.saturating_add(self.size.h))
+                    .min(other.loc.y.saturating_add(other.size.h)),
             ),
         ))
     }
@@ -955,38 +1191,194 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
     /// Merge two [`Rectangle`] by producing the smallest rectangle that contains both
     #[inline]
     pub fn merge(self, other: Self) -> Self {
-        Self::bounding_box([self.loc, self.loc + self.size, other.loc, other.loc + other.size])
+        Self::bounding_box([
+            self.loc,
+            self.loc + self.size,
+            other.loc,
+            other.loc + other.size,
+        ])
+    }
+
+    /// Subtract another [`Rectangle`] from this [`Rectangle`]
+    ///
+    /// If the rectangles to not overlap the original rectangle will
+    /// be returned.
+    /// If the other rectangle contains self no rectangle will be returned,
+    /// otherwise up to 4 rectangles will be returned.
+    pub fn subtract_rect(self, other: Self) -> Vec<Self> {
+        self.subtract_rects([other])
+    }
+
+    /// Subtract a set of [`Rectangle`]s from this [`Rectangle`]
+    pub fn subtract_rects(self, others: impl IntoIterator<Item = Self>) -> Vec<Self> {
+        let mut remaining = Vec::with_capacity(4);
+        remaining.push(self);
+        Self::subtract_rects_many_in_place(remaining, others)
+    }
+
+    /// Subtract a set of [`Rectangle`]s from a set [`Rectangle`]s
+    pub fn subtract_rects_many(
+        rects: impl IntoIterator<Item = Self>,
+        others: impl IntoIterator<Item = Self>,
+    ) -> Vec<Self> {
+        let remaining = rects.into_iter().collect::<Vec<_>>();
+        Self::subtract_rects_many_in_place(remaining, others)
+    }
+
+    /// Subtract a set of [`Rectangle`]s from a set [`Rectangle`]s in-place
+    pub fn subtract_rects_many_in_place(
+        mut rects: Vec<Self>,
+        others: impl IntoIterator<Item = Self>,
+    ) -> Vec<Self> {
+        for other in others {
+            let items = rects.len();
+            let mut checked = 0usize;
+            let mut index = 0usize;
+
+            while checked != items {
+                checked += 1;
+
+                // If there is no overlap there is nothing to subtract
+                if !rects[index].overlaps(other) {
+                    index += 1;
+                    continue;
+                }
+
+                // We now know that we have to subtract the other rect
+                let item = rects.remove(index);
+
+                // If we are completely contained then nothing is left
+                if other.contains_rect(item) {
+                    continue;
+                }
+
+                // we already checked that there is an overlap so the unwrap should be safe
+                let intersection = item.intersection(other).unwrap();
+
+                let top_rect = Rectangle::from_loc_and_size(
+                    item.loc,
+                    (item.size.w, intersection.loc.y.saturating_sub(item.loc.y)),
+                );
+                let left_rect: Rectangle<N, Kind> = Rectangle::from_loc_and_size(
+                    (item.loc.x, intersection.loc.y),
+                    (
+                        intersection.loc.x.saturating_sub(item.loc.x),
+                        intersection.size.h,
+                    ),
+                );
+                let right_rect: Rectangle<N, Kind> = Rectangle::from_loc_and_size(
+                    (
+                        intersection.loc.x.saturating_add(intersection.size.w),
+                        intersection.loc.y,
+                    ),
+                    (
+                        (item.loc.x.saturating_add(item.size.w))
+                            .saturating_sub(intersection.loc.x.saturating_add(intersection.size.w)),
+                        intersection.size.h,
+                    ),
+                );
+                let bottom_rect: Rectangle<N, Kind> = Rectangle::from_loc_and_size(
+                    (
+                        item.loc.x,
+                        intersection.loc.y.saturating_add(intersection.size.h),
+                    ),
+                    (
+                        item.size.w,
+                        (item.loc.y.saturating_add(item.size.h))
+                            .saturating_sub(intersection.loc.y.saturating_add(intersection.size.h)),
+                    ),
+                );
+
+                if !top_rect.is_empty() {
+                    rects.push(top_rect);
+                }
+
+                if !left_rect.is_empty() {
+                    rects.push(left_rect);
+                }
+
+                if !right_rect.is_empty() {
+                    rects.push(right_rect);
+                }
+
+                if !bottom_rect.is_empty() {
+                    rects.push(bottom_rect);
+                }
+            }
+        }
+
+        rects
     }
 }
 
 impl<N: Coordinate> Rectangle<N, Logical> {
     /// Convert this logical rectangle to physical coordinate space according to given scale factor
     #[inline]
-    pub fn to_physical(self, scale: N) -> Rectangle<N, Physical> {
+    pub fn to_physical(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Physical> {
+        let scale = scale.into();
         Rectangle {
             loc: self.loc.to_physical(scale),
             size: self.size.to_physical(scale),
         }
     }
 
+    /// Convert this logical rectangle to physical coordinate space according to given scale factor
+    /// and round the result
+    #[inline]
+    pub fn to_physical_precise_round<S: Coordinate, R: Coordinate>(
+        self,
+        scale: impl Into<Scale<S>>,
+    ) -> Rectangle<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_round()
+    }
+
+    /// Convert this logical rectangle to physical coordinate space according to given scale factor,
+    /// returning the largest N-space rectangle fitting into the N-based rectangle
+    ///
+    /// This will ceil the location and floor the size after applying the scale
+    #[inline]
+    pub fn to_physical_precise_down<S: Coordinate, R: Coordinate>(
+        &self,
+        scale: impl Into<Scale<S>>,
+    ) -> Rectangle<R, Physical> {
+        self.to_f64()
+            .to_physical(scale.into().to_f64())
+            .to_i32_down()
+    }
+
+    /// Convert this logical rectangle to physical coordinate space according to given scale factor,
+    /// returning the smallest N-space rectangle encapsulating the N-based rectangle
+    ///
+    /// This will floor the location and ceil the size after applying the scale
+    #[inline]
+    pub fn to_physical_precise_up<S: Coordinate, R: Coordinate>(
+        &self,
+        scale: impl Into<Scale<S>>,
+    ) -> Rectangle<R, Physical> {
+        self.to_f64().to_physical(scale.into().to_f64()).to_i32_up()
+    }
+
     /// Convert this logical rectangle to buffer coordinate space according to given scale factor
     #[inline]
     pub fn to_buffer(
         self,
-        scale: N,
+        scale: impl Into<Scale<N>>,
         transformation: Transform,
         area: &Size<N, Logical>,
     ) -> Rectangle<N, Buffer> {
         let rect = transformation.transform_rect_in(self, area);
+        let scale = scale.into();
         Rectangle {
             loc: Point {
-                x: rect.loc.x.upscale(scale),
-                y: rect.loc.y.upscale(scale),
+                x: rect.loc.x.upscale(scale.x),
+                y: rect.loc.y.upscale(scale.y),
                 _kind: std::marker::PhantomData,
             },
             size: Size {
-                w: rect.size.w.upscale(scale),
-                h: rect.size.h.upscale(scale),
+                w: rect.size.w.upscale(scale.x),
+                h: rect.size.h.upscale(scale.y),
                 _kind: std::marker::PhantomData,
             },
         }
@@ -996,7 +1388,8 @@ impl<N: Coordinate> Rectangle<N, Logical> {
 impl<N: Coordinate> Rectangle<N, Physical> {
     /// Convert this physical rectangle to logical coordinate space according to given scale factor
     #[inline]
-    pub fn to_logical(self, scale: N) -> Rectangle<N, Logical> {
+    pub fn to_logical(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Logical> {
+        let scale = scale.into();
         Rectangle {
             loc: self.loc.to_logical(scale),
             size: self.size.to_logical(scale),
@@ -1009,62 +1402,31 @@ impl<N: Coordinate> Rectangle<N, Buffer> {
     #[inline]
     pub fn to_logical(
         self,
-        scale: N,
+        scale: impl Into<Scale<N>>,
         transformation: Transform,
         area: &Size<N, Buffer>,
     ) -> Rectangle<N, Logical> {
         let rect = transformation.invert().transform_rect_in(self, area);
+        let scale = scale.into();
         Rectangle {
             loc: Point {
-                x: rect.loc.x.downscale(scale),
-                y: rect.loc.y.downscale(scale),
+                x: rect.loc.x.downscale(scale.x),
+                y: rect.loc.y.downscale(scale.y),
                 _kind: std::marker::PhantomData,
             },
             size: Size {
-                w: rect.size.w.downscale(scale),
-                h: rect.size.h.downscale(scale),
+                w: rect.size.w.downscale(scale.x),
+                h: rect.size.h.downscale(scale.y),
                 _kind: std::marker::PhantomData,
             },
         }
     }
 }
 
-impl<N: fmt::Debug> fmt::Debug for Rectangle<N, Logical> {
+impl<N: fmt::Debug, S> fmt::Debug for Rectangle<N, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rectangle<Logical>")
-            .field("x", &self.loc.x)
-            .field("y", &self.loc.y)
-            .field("width", &self.size.w)
-            .field("height", &self.size.h)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Rectangle<N, Physical> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rectangle<Physical>")
-            .field("x", &self.loc.x)
-            .field("y", &self.loc.y)
-            .field("width", &self.size.w)
-            .field("height", &self.size.h)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Rectangle<N, Raw> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rectangle<Raw>")
-            .field("x", &self.loc.x)
-            .field("y", &self.loc.y)
-            .field("width", &self.size.w)
-            .field("height", &self.size.h)
-            .finish()
-    }
-}
-
-impl<N: fmt::Debug> fmt::Debug for Rectangle<N, Buffer> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rectangle<Buffer>")
+        f.write_fmt(format_args!("Rectangle<{}>", std::any::type_name::<S>()))?;
+        f.debug_struct("")
             .field("x", &self.loc.x)
             .field("y", &self.loc.y)
             .field("width", &self.size.w)
@@ -1104,8 +1466,10 @@ impl<N: Default, Kind> Default for Rectangle<N, Kind> {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 /// Possible transformations to two-dimensional planes
+#[derive(Default)]
 pub enum Transform {
     /// Identity transformation (plane is unaltered when applied)
+    #[default]
     Normal,
     /// Plane is rotated by 90 degrees
     _90,
@@ -1121,12 +1485,6 @@ pub enum Transform {
     Flipped180,
     /// Plane is flipped vertically and rotated by 270 degrees
     Flipped270,
-}
-
-impl Default for Transform {
-    fn default() -> Transform {
-        Transform::Normal
-    }
 }
 
 impl Transform {
@@ -1195,16 +1553,73 @@ impl Transform {
                 .into(),
             Transform::_270 => (rect.loc.y, area.w - rect.loc.x - rect.size.w).into(),
             Transform::Flipped => (area.w - rect.loc.x - rect.size.w, rect.loc.y).into(),
-            Transform::Flipped90 => (rect.loc.y, rect.loc.x).into(),
-            Transform::Flipped180 => (rect.loc.x, area.h - rect.loc.y - rect.size.h).into(),
-            Transform::Flipped270 => (
+            Transform::Flipped90 => (
                 area.h - rect.loc.y - rect.size.h,
                 area.w - rect.loc.x - rect.size.w,
             )
                 .into(),
+            Transform::Flipped180 => (rect.loc.x, area.h - rect.loc.y - rect.size.h).into(),
+            Transform::Flipped270 => (rect.loc.y, rect.loc.x).into(),
         };
 
         Rectangle::from_loc_and_size(loc, size)
+    }
+
+    /// Returns true if the transformation would flip contents
+    pub fn flipped(&self) -> bool {
+        !matches!(
+            self,
+            Transform::Normal | Transform::_90 | Transform::_180 | Transform::_270
+        )
+    }
+
+    /// Returns the angle (in degrees) of the transformation
+    pub fn degrees(&self) -> u32 {
+        match self {
+            Transform::Normal | Transform::Flipped => 0,
+            Transform::_90 | Transform::Flipped90 => 90,
+            Transform::_180 | Transform::Flipped180 => 180,
+            Transform::_270 | Transform::Flipped270 => 270,
+        }
+    }
+}
+
+impl std::ops::Add for Transform {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        let flipped = matches!(
+            (self.flipped(), other.flipped()),
+            (true, false) | (false, true)
+        );
+        let degrees = (self.degrees() + other.degrees()) % 360;
+        match (flipped, degrees) {
+            (false, 0) => Transform::Normal,
+            (false, 90) => Transform::_90,
+            (false, 180) => Transform::_180,
+            (false, 270) => Transform::_270,
+            (true, 0) => Transform::Flipped,
+            (true, 90) => Transform::Flipped90,
+            (true, 180) => Transform::Flipped180,
+            (true, 270) => Transform::Flipped270,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(feature = "wayland_frontend")]
+impl From<Transform> for WlTransform {
+    fn from(transform: Transform) -> Self {
+        match transform {
+            Transform::Normal => WlTransform::Normal,
+            Transform::_90 => WlTransform::_90,
+            Transform::_180 => WlTransform::_180,
+            Transform::_270 => WlTransform::_270,
+            Transform::Flipped => WlTransform::Flipped,
+            Transform::Flipped90 => WlTransform::Flipped90,
+            Transform::Flipped180 => WlTransform::Flipped180,
+            Transform::Flipped270 => WlTransform::Flipped270,
+        }
     }
 }
 
@@ -1276,7 +1691,7 @@ mod tests {
         let transform = Transform::Flipped90;
 
         assert_eq!(
-            Rectangle::from_loc_and_size((20, 10), (40, 30)),
+            Rectangle::from_loc_and_size((20, 30), (40, 30)),
             transform.transform_rect_in(rect, &size)
         )
     }
@@ -1300,8 +1715,160 @@ mod tests {
         let transform = Transform::Flipped270;
 
         assert_eq!(
-            Rectangle::from_loc_and_size((30, 30), (40, 30)),
+            Rectangle::from_loc_and_size((20, 10), (40, 30)),
             transform.transform_rect_in(rect, &size)
         )
+    }
+
+    #[test]
+    fn rectangle_contains_rect_itself() {
+        let rect = Rectangle::<i32, Logical>::from_loc_and_size((10, 20), (30, 40));
+        assert!(rect.contains_rect(rect));
+    }
+
+    #[test]
+    fn rectangle_contains_rect_outside() {
+        let first = Rectangle::<i32, Logical>::from_loc_and_size((10, 20), (30, 40));
+        let second = Rectangle::<i32, Logical>::from_loc_and_size((41, 61), (30, 40));
+        assert!(!first.contains_rect(second));
+    }
+
+    #[test]
+    fn rectangle_contains_rect_extends() {
+        let first = Rectangle::<i32, Logical>::from_loc_and_size((10, 20), (30, 40));
+        let second = Rectangle::<i32, Logical>::from_loc_and_size((10, 20), (30, 45));
+        assert!(!first.contains_rect(second));
+    }
+
+    #[test]
+    fn rectangle_subtract_full() {
+        let outer = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 100));
+        let inner = Rectangle::<i32, Logical>::from_loc_and_size((-10, -10), (1000, 1000));
+
+        let rects = outer.subtract_rect(inner);
+        assert_eq!(rects, vec![])
+    }
+
+    #[test]
+    fn rectangle_subtract_center_hole() {
+        let outer = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 100));
+        let inner = Rectangle::<i32, Logical>::from_loc_and_size((10, 10), (80, 80));
+
+        let rects = outer.subtract_rect(inner);
+        assert_eq!(
+            rects,
+            vec![
+                // Top rect
+                Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 10)),
+                // Left rect
+                Rectangle::<i32, Logical>::from_loc_and_size((0, 10), (10, 80)),
+                // Right rect
+                Rectangle::<i32, Logical>::from_loc_and_size((90, 10), (10, 80)),
+                // Bottom rect
+                Rectangle::<i32, Logical>::from_loc_and_size((0, 90), (100, 10)),
+            ]
+        )
+    }
+
+    #[test]
+    fn rectangle_subtract_full_top() {
+        let outer = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 100));
+        let inner = Rectangle::<i32, Logical>::from_loc_and_size((0, -20), (100, 100));
+
+        let rects = outer.subtract_rect(inner);
+        assert_eq!(
+            rects,
+            vec![
+                // Bottom rect
+                Rectangle::<i32, Logical>::from_loc_and_size((0, 80), (100, 20)),
+            ]
+        )
+    }
+
+    #[test]
+    fn rectangle_subtract_full_bottom() {
+        let outer = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 100));
+        let inner = Rectangle::<i32, Logical>::from_loc_and_size((0, 20), (100, 100));
+
+        let rects = outer.subtract_rect(inner);
+        assert_eq!(
+            rects,
+            vec![
+                // Top rect
+                Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 20)),
+            ]
+        )
+    }
+
+    #[test]
+    fn rectangle_subtract_full_left() {
+        let outer = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 100));
+        let inner = Rectangle::<i32, Logical>::from_loc_and_size((-20, 0), (100, 100));
+
+        let rects = outer.subtract_rect(inner);
+        assert_eq!(
+            rects,
+            vec![
+                // Right rect
+                Rectangle::<i32, Logical>::from_loc_and_size((80, 0), (20, 100)),
+            ]
+        )
+    }
+
+    #[test]
+    fn rectangle_subtract_full_right() {
+        let outer = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 100));
+        let inner = Rectangle::<i32, Logical>::from_loc_and_size((20, 0), (100, 100));
+
+        let rects = outer.subtract_rect(inner);
+        assert_eq!(
+            rects,
+            vec![
+                // Left rect
+                Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (20, 100)),
+            ]
+        )
+    }
+
+    #[test]
+    fn rectangle_overlaps_or_touches_top() {
+        let top = Rectangle::<i32, Logical>::from_loc_and_size((0, -24), (800, 24));
+        let main = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (800, 600));
+        assert!(main.overlaps_or_touches(top));
+    }
+
+    #[test]
+    fn rectangle_overlaps_or_touches_left() {
+        let left = Rectangle::<i32, Logical>::from_loc_and_size((-4, -24), (4, 624));
+        let main = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (800, 600));
+        assert!(main.overlaps_or_touches(left));
+    }
+
+    #[test]
+    fn rectangle_overlaps_or_touches_right() {
+        let right = Rectangle::<i32, Logical>::from_loc_and_size((800, -24), (4, 624));
+        let main = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (800, 600));
+        assert!(main.overlaps_or_touches(right));
+    }
+
+    #[test]
+    fn rectangle_no_overlap_top() {
+        let top = Rectangle::<i32, Logical>::from_loc_and_size((0, -24), (800, 24));
+        let main = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (800, 600));
+        assert!(!main.overlaps(top));
+    }
+
+    #[test]
+    fn rectangle_no_overlap_left() {
+        let left = Rectangle::<i32, Logical>::from_loc_and_size((-4, -24), (4, 624));
+        let main = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (800, 600));
+        assert!(!main.overlaps(left));
+    }
+
+    #[test]
+    fn rectangle_no_overlap_right() {
+        let right = Rectangle::<i32, Logical>::from_loc_and_size((800, -24), (4, 624));
+        let main = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (800, 600));
+        assert!(!main.overlaps(right));
     }
 }

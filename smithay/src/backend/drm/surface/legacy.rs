@@ -1,19 +1,19 @@
 use drm::control::{connector, crtc, encoder, framebuffer, Device as ControlDevice, Mode, PageFlipFlags};
 
 use std::collections::HashSet;
-use std::os::unix::io::AsRawFd;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, RwLock,
 };
 
-use crate::backend::drm::{
-    device::legacy::set_connector_state,
-    device::{DevPath, DrmDeviceInternal},
-    error::Error,
+use crate::{
+    backend::drm::{
+        device::legacy::set_connector_state, device::DrmDeviceInternal, error::Error, DrmDeviceFd,
+    },
+    utils::DevPath,
 };
 
-use slog::{debug, info, o, trace};
+use tracing::{debug, info, info_span, instrument, trace};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct State {
@@ -22,7 +22,7 @@ pub struct State {
 }
 
 impl State {
-    fn current_state<A: AsRawFd + ControlDevice>(fd: &A, crtc: crtc::Handle) -> Result<Self, Error> {
+    fn current_state<A: DevPath + ControlDevice>(fd: &A, crtc: crtc::Handle) -> Result<Self, Error> {
         // Try to enumarate the current state to set the initial state variable correctly.
         // We need an accurate state to handle `commit_pending`.
         let crtc_info = fd.get_crtc(crtc).map_err(|source| Error::Access {
@@ -40,7 +40,7 @@ impl State {
             source,
         })?;
         for &con in res_handles.connectors() {
-            let con_info = fd.get_connector(con).map_err(|source| Error::Access {
+            let con_info = fd.get_connector(con, false).map_err(|source| Error::Access {
                 errmsg: "Error loading connector info",
                 dev: fd.dev_path(),
                 source,
@@ -71,29 +71,26 @@ impl State {
 }
 
 #[derive(Debug)]
-pub struct LegacyDrmSurface<A: AsRawFd + 'static> {
-    pub(super) fd: Arc<DrmDeviceInternal<A>>,
+pub struct LegacyDrmSurface {
+    pub(super) fd: Arc<DrmDeviceInternal>,
     pub(super) active: Arc<AtomicBool>,
     crtc: crtc::Handle,
     state: RwLock<State>,
     pending: RwLock<State>,
-    pub(crate) logger: ::slog::Logger,
+    pub(super) span: tracing::Span,
 }
 
-impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
+impl LegacyDrmSurface {
     pub fn new(
-        fd: Arc<DrmDeviceInternal<A>>,
+        fd: Arc<DrmDeviceInternal>,
         active: Arc<AtomicBool>,
         crtc: crtc::Handle,
         mode: Mode,
         connectors: &[connector::Handle],
-        logger: ::slog::Logger,
     ) -> Result<Self, Error> {
-        let logger = logger.new(o!("smithay_module" => "backend_drm_legacy", "drm_module" => "surface"));
-        info!(
-            logger,
-            "Initializing drm surface with mode {:?} and connectors {:?}", mode, connectors
-        );
+        let span = info_span!("drm_legacy", crtc = ?crtc);
+        let _guard = span.enter();
+        info!(?mode, ?connectors, ?crtc, "Initializing drm surface",);
 
         let state = State::current_state(&*fd, crtc)?;
         let pending = State {
@@ -101,13 +98,14 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
             connectors: connectors.iter().copied().collect(),
         };
 
+        drop(_guard);
         let surface = LegacyDrmSurface {
             fd,
             active,
             crtc,
             state: RwLock::new(state),
             pending: RwLock::new(pending),
-            logger,
+            span,
         };
 
         Ok(surface)
@@ -129,6 +127,7 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         self.pending.read().unwrap().mode
     }
 
+    #[instrument(parent = &self.span, skip(self))]
     pub fn add_connector(&self, conn: connector::Handle) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -143,6 +142,7 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         Ok(())
     }
 
+    #[instrument(parent = &self.span, skip(self))]
     pub fn remove_connector(&self, connector: connector::Handle) -> Result<(), Error> {
         let mut pending = self.pending.write().unwrap();
 
@@ -154,6 +154,7 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         Ok(())
     }
 
+    #[instrument(parent = &self.span, skip(self))]
     pub fn set_connectors(&self, connectors: &[connector::Handle]) -> Result<(), Error> {
         if connectors.is_empty() {
             return Err(Error::SurfaceWithoutConnectors(self.crtc));
@@ -178,6 +179,7 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         Ok(())
     }
 
+    #[instrument(level = "debug", parent = &self.span, skip(self))]
     pub fn use_mode(&self, mode: Mode) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -189,7 +191,7 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         for connector in &pending.connectors {
             if !self
                 .fd
-                .get_connector(*connector)
+                .get_connector(*connector, false)
                 .map_err(|source| Error::Access {
                     errmsg: "Error loading connector info",
                     dev: self.fd.dev_path(),
@@ -211,6 +213,8 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         *self.pending.read().unwrap() != *self.state.read().unwrap()
     }
 
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
     pub fn commit(&self, framebuffer: framebuffer::Handle, event: bool) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -225,10 +229,10 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
 
             let mut conn_removed = false;
             for conn in removed.clone() {
-                if let Ok(info) = self.fd.get_connector(*conn) {
-                    info!(self.logger, "Removing connector: {:?}", info.interface());
+                if let Ok(info) = self.fd.get_connector(*conn, false) {
+                    info!("Removing connector: {:?}", info.interface());
                 } else {
-                    info!(self.logger, "Removing unknown connector");
+                    info!("Removing unknown connector");
                 }
                 // if the connector was mapped to our crtc, we need to ack the disconnect.
                 // the graphics pipeline will not be freed otherwise
@@ -248,20 +252,20 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
             }
 
             for conn in added.clone() {
-                if let Ok(info) = self.fd.get_connector(*conn) {
-                    info!(self.logger, "Adding connector: {:?}", info.interface());
+                if let Ok(info) = self.fd.get_connector(*conn, false) {
+                    info!("Adding connector: {:?}", info.interface());
                 } else {
-                    info!(self.logger, "Adding unknown connector");
+                    info!("Adding unknown connector");
                 }
             }
             set_connector_state(&*self.fd, added.copied(), true)?;
 
             if current.mode != pending.mode {
-                info!(self.logger, "Setting new mode: {:?}", pending.mode.name());
+                info!("Setting new mode: {:?}", pending.mode.name());
             }
         }
 
-        debug!(self.logger, "Setting screen");
+        debug!("Setting screen");
         // do a modeset and attach the given framebuffer
         self.fd
             .set_crtc(
@@ -301,8 +305,10 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         Ok(())
     }
 
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
     pub fn page_flip(&self, framebuffer: framebuffer::Handle, event: bool) -> Result<(), Error> {
-        trace!(self.logger, "Queueing Page flip");
+        trace!("Queueing Page flip");
 
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -326,16 +332,17 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         })
     }
 
-    pub fn test_buffer(&self, fb: framebuffer::Handle, mode: &Mode) -> Result<bool, Error> {
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
+    pub fn test_buffer(&self, fb: framebuffer::Handle, mode: &Mode) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
 
         let pending = self.pending.read().unwrap();
 
-        debug!(self.logger, "Setting screen for buffer *testing*");
-        Ok(self
-            .fd
+        debug!("Setting screen for buffer *testing*");
+        self.fd
             .set_crtc(
                 self.crtc,
                 Some(fb),
@@ -347,7 +354,11 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
                     .collect::<Vec<connector::Handle>>(),
                 Some(*mode),
             )
-            .is_ok())
+            .map_err(|source| Error::Access {
+                errmsg: "Failed to test buffer",
+                dev: self.fd.dev_path(),
+                source,
+            })
     }
 
     // we use this function to verify, if a certain connector/mode combination
@@ -358,11 +369,14 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
     // Better would be some kind of test commit to ask the driver,
     // but that only exists for the atomic api.
     fn check_connector(&self, conn: connector::Handle, mode: &Mode) -> Result<bool, Error> {
-        let info = self.fd.get_connector(conn).map_err(|source| Error::Access {
-            errmsg: "Error loading connector info",
-            dev: self.fd.dev_path(),
-            source,
-        })?;
+        let info = self
+            .fd
+            .get_connector(conn, false)
+            .map_err(|source| Error::Access {
+                errmsg: "Error loading connector info",
+                dev: self.fd.dev_path(),
+                source,
+            })?;
 
         // check if the connector can handle the current mode
         if info.modes().contains(mode) {
@@ -370,7 +384,6 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
             let encoders = info
                 .encoders()
                 .iter()
-                .flatten()
                 .map(|encoder| {
                     self.fd.get_encoder(*encoder).map_err(|source| Error::Access {
                         errmsg: "Error loading encoder info",
@@ -400,7 +413,7 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         }
     }
 
-    pub(crate) fn reset_state<B: AsRawFd + ControlDevice + 'static>(
+    pub(crate) fn reset_state<B: DevPath + ControlDevice + 'static>(
         &self,
         fd: Option<&B>,
     ) -> Result<(), Error> {
@@ -411,10 +424,15 @@ impl<A: AsRawFd + 'static> LegacyDrmSurface<A> {
         };
         Ok(())
     }
+
+    pub(crate) fn device_fd(&self) -> &DrmDeviceFd {
+        self.fd.device_fd()
+    }
 }
 
-impl<A: AsRawFd + 'static> Drop for LegacyDrmSurface<A> {
+impl Drop for LegacyDrmSurface {
     fn drop(&mut self) {
+        let _guard = self.span.enter();
         // ignore failure at this point
 
         if !self.active.load(Ordering::SeqCst) {
@@ -437,12 +455,11 @@ impl<A: AsRawFd + 'static> Drop for LegacyDrmSurface<A> {
 #[cfg(test)]
 mod test {
     use super::LegacyDrmSurface;
-    use std::fs::File;
 
     fn is_send<S: Send>() {}
 
     #[test]
     fn surface_is_send() {
-        is_send::<LegacyDrmSurface<File>>();
+        is_send::<LegacyDrmSurface>();
     }
 }
